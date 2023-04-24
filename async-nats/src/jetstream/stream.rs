@@ -1295,6 +1295,8 @@ pub struct Source {
     /// Optional config to set a domain, if source is residing in different one.
     #[serde(default, skip_serializing_if = "is_default")]
     pub domain: Option<String>,
+    #[serde(with = "serde_nanos", default, skip_serializing_if = "Option::is_none")]
+    pub idle_heartbeat: Option<Duration>,
     /// Optional config to set the subject transform destination
     #[cfg(feature = "server_2_10")]
     #[serde(
@@ -1584,5 +1586,43 @@ impl futures::Stream for Consumers<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_source_heartbeat() {
+        assert_eq!(
+            serde_json::to_value(Source {
+                name: "test".to_string(),
+                idle_heartbeat: Some(Duration::from_secs(2)),
+                ..Default::default()
+            })
+            .unwrap(),
+            json!({
+                "name": "test",
+                "idle_heartbeat": 2_000_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn deserialize_source_heartbeat() {
+        let source = json!({
+            "name": "test",
+            "idle_heartbeat": 1_234_567_890,
+        });
+
+        assert_eq!(
+            serde_json::from_value::<Source>(source).unwrap(),
+            Source {
+                name: "test".to_string(),
+                idle_heartbeat: Some(Duration::from_nanos(1_234_567_890)),
+                ..Default::default()
+            }
+        );
     }
 }
