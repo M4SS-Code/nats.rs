@@ -30,7 +30,7 @@ use crate::{Error, StatusCode};
 use base64::engine::general_purpose::STANDARD;
 use base64::engine::Engine;
 use bytes::Bytes;
-use futures::{future::BoxFuture, TryFutureExt};
+use futures::{future::BoxFuture, FutureExt, TryFutureExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use time::{serde::rfc3339, OffsetDateTime};
@@ -1621,60 +1621,63 @@ impl futures::Stream for ConsumerNames<'_> {
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.page_request.as_mut() {
-            Some(page) => match page.try_poll_unpin(cx) {
-                std::task::Poll::Ready(page) => {
-                    self.page_request = None;
-                    let page = page.map_err(|err| {
-                        ConsumerNamesError::with_source(RequestErrorKind::Other, err)
-                    })?;
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
 
-                    if let Some(consumers) = page.consumers {
-                        self.offset += consumers.len();
-                        self.consumers = consumers;
-                        if self.offset >= page.total {
-                            self.done = true;
+        loop {
+            if let Some(consumer) = this.consumers.pop() {
+                return Poll::Ready(Some(Ok(consumer)));
+            }
+
+            if this.done {
+                return Poll::Ready(None);
+            }
+
+            let page_request = this.page_request.get_or_insert_with(|| {
+                let context = this.context.clone();
+                let offset = this.offset;
+                let stream = this.stream.clone();
+
+                Box::pin(async move {
+                    match context
+                        .request(
+                            format!("CONSUMER.NAMES.{stream}"),
+                            &json!({
+                                "offset": offset,
+                            }),
+                        )
+                        .await?
+                    {
+                        Response::Err { error } => Err(RequestError::with_source(
+                            super::context::RequestErrorKind::Other,
+                            error,
+                        )),
+                        Response::Ok(page) => Ok(page),
+                    }
+                })
+            });
+
+            match page_request.poll_unpin(cx) {
+                Poll::Ready(page_result) => {
+                    this.page_request = None;
+
+                    let page = page_result
+                        .map_err(|err| ConsumersError::with_source(RequestErrorKind::Other, err))?;
+                    match page.consumers {
+                        Some(consumers) => {
+                            this.consumers = consumers;
+
+                            this.offset += this.consumers.len();
+                            this.done = this.offset >= page.total;
+                            continue;
                         }
-                        match self.consumers.pop() {
-                            Some(stream) => Poll::Ready(Some(Ok(stream))),
-                            None => Poll::Ready(None),
+                        None => {
+                            this.done = true;
+                            return Poll::Ready(None);
                         }
-                    } else {
-                        Poll::Ready(None)
                     }
                 }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            },
-            None => {
-                if let Some(stream) = self.consumers.pop() {
-                    Poll::Ready(Some(Ok(stream)))
-                } else {
-                    if self.done {
-                        return Poll::Ready(None);
-                    }
-                    let context = self.context.clone();
-                    let offset = self.offset;
-                    let stream = self.stream.clone();
-                    self.page_request = Some(Box::pin(async move {
-                        match context
-                            .request(
-                                format!("CONSUMER.NAMES.{stream}"),
-                                &json!({
-                                    "offset": offset,
-                                }),
-                            )
-                            .await?
-                        {
-                            Response::Err { error } => Err(RequestError::with_source(
-                                super::context::RequestErrorKind::Other,
-                                error,
-                            )),
-                            Response::Ok(page) => Ok(page),
-                        }
-                    }));
-                    self.poll_next(cx)
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
@@ -1698,58 +1701,63 @@ impl futures::Stream for Consumers<'_> {
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match self.page_request.as_mut() {
-            Some(page) => match page.try_poll_unpin(cx) {
-                std::task::Poll::Ready(page) => {
-                    self.page_request = None;
-                    let page = page
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+
+        loop {
+            if let Some(consumer) = this.consumers.pop() {
+                return Poll::Ready(Some(Ok(consumer)));
+            }
+
+            if this.done {
+                return Poll::Ready(None);
+            }
+
+            let page_request = this.page_request.get_or_insert_with(|| {
+                let context = this.context.clone();
+                let offset = this.offset;
+                let stream = this.stream.clone();
+
+                Box::pin(async move {
+                    match context
+                        .request(
+                            format!("CONSUMER.LIST.{stream}"),
+                            &json!({
+                                "offset": offset,
+                            }),
+                        )
+                        .await?
+                    {
+                        Response::Err { error } => Err(RequestError::with_source(
+                            super::context::RequestErrorKind::Other,
+                            error,
+                        )),
+                        Response::Ok(page) => Ok(page),
+                    }
+                })
+            });
+
+            match page_request.poll_unpin(cx) {
+                Poll::Ready(page_result) => {
+                    this.page_request = None;
+
+                    let page = page_result
                         .map_err(|err| ConsumersError::with_source(RequestErrorKind::Other, err))?;
-                    if let Some(consumers) = page.consumers {
-                        self.offset += consumers.len();
-                        self.consumers = consumers;
-                        if self.offset >= page.total {
-                            self.done = true;
+                    match page.consumers {
+                        Some(consumers) => {
+                            this.consumers = consumers;
+
+                            this.offset += this.consumers.len();
+                            this.done = this.offset >= page.total;
+                            continue;
                         }
-                        match self.consumers.pop() {
-                            Some(consumer) => Poll::Ready(Some(Ok(consumer))),
-                            None => Poll::Ready(None),
+                        None => {
+                            this.done = true;
+                            return Poll::Ready(None);
                         }
-                    } else {
-                        Poll::Ready(None)
                     }
                 }
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            },
-            None => {
-                if let Some(stream) = self.consumers.pop() {
-                    Poll::Ready(Some(Ok(stream)))
-                } else {
-                    if self.done {
-                        return Poll::Ready(None);
-                    }
-                    let context = self.context.clone();
-                    let offset = self.offset;
-                    let stream = self.stream.clone();
-                    self.page_request = Some(Box::pin(async move {
-                        match context
-                            .request(
-                                format!("CONSUMER.LIST.{stream}"),
-                                &json!({
-                                    "offset": offset,
-                                }),
-                            )
-                            .await?
-                        {
-                            Response::Err { error } => Err(RequestError::with_source(
-                                super::context::RequestErrorKind::Other,
-                                error,
-                            )),
-                            Response::Ok(page) => Ok(page),
-                        }
-                    }));
-                    self.poll_next(cx)
-                }
+                Poll::Pending => return Poll::Pending,
             }
         }
     }
