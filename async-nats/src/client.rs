@@ -473,6 +473,7 @@ impl Client {
     /// # }
     /// ```
     pub async fn flush(&self) -> Result<(), FlushError> {
+        /*
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
             .send(Command::Flush { result: tx })
@@ -483,6 +484,8 @@ impl Client {
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?;
         Ok(())
+        */
+        todo!()
     }
 
     /// Returns the current state of the connection.

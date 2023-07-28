@@ -121,14 +121,13 @@
 
 use thiserror::Error;
 
-use futures::future::FutureExt;
-use futures::select;
 use futures::stream::Stream;
 use tracing::{debug, error};
 
 use core::fmt;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::future::Future;
 use std::iter;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::option;
@@ -144,7 +143,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use tokio::io;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -276,10 +275,6 @@ pub(crate) enum Command {
         sid: u64,
         max: Option<u64>,
     },
-    Flush {
-        result: oneshot::Sender<Result<(), io::Error>>,
-    },
-    TryFlush,
 }
 
 /// `ClientOp` represents all actions of `Client`.
@@ -322,7 +317,6 @@ pub(crate) struct ConnectionHandler {
     pending_pings: usize,
     info_sender: tokio::sync::watch::Sender<ServerInfo>,
     ping_interval: Interval,
-    flush_interval: Interval,
 }
 
 impl ConnectionHandler {
@@ -331,13 +325,9 @@ impl ConnectionHandler {
         connector: Connector,
         info_sender: tokio::sync::watch::Sender<ServerInfo>,
         ping_period: Duration,
-        flush_period: Duration,
     ) -> ConnectionHandler {
         let mut ping_interval = interval(ping_period);
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-        let mut flush_interval = interval(flush_period);
-        flush_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         ConnectionHandler {
             connection,
@@ -346,92 +336,89 @@ impl ConnectionHandler {
             pending_pings: 0,
             info_sender,
             ping_interval,
-            flush_interval,
         }
     }
 
-    pub(crate) async fn process(
-        &mut self,
-        mut receiver: mpsc::Receiver<Command>,
-    ) -> Result<(), io::Error> {
-        loop {
-            select! {
-                _ = self.ping_interval.tick().fuse() => {
-                    self.pending_pings += 1;
+    pub(crate) fn process<'a>(
+        &'a mut self,
+        receiver: &'a mut mpsc::Receiver<Command>,
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        struct ProcessFut<'a> {
+            handler: &'a mut ConnectionHandler,
+            receiver: &'a mut mpsc::Receiver<Command>,
+        }
 
-                    if self.pending_pings > MAX_PENDING_PINGS {
+        impl<'a> Future for ProcessFut<'a> {
+            type Output = io::Result<()>;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.handler.ping_interval.poll_tick(cx).is_ready() {
+                    self.handler.pending_pings += 1;
+
+                    if self.handler.pending_pings > MAX_PENDING_PINGS {
                         debug!(
                             "pending pings {}, max pings {}. disconnecting",
-                            self.pending_pings, MAX_PENDING_PINGS
+                            self.handler.pending_pings, MAX_PENDING_PINGS
                         );
-                        self.handle_disconnect().await?;
-                    }
 
-                    if let Err(_err) = self.connection.write_op(&ClientOp::Ping).await {
-                        self.handle_disconnect().await?;
-                    }
-
-                    self.handle_flush().await?;
-
-                },
-                _ = self.flush_interval.tick().fuse() => {
-                    if let Err(_err) = self.handle_flush().await {
-                        self.handle_disconnect().await?;
-                    }
-                },
-                maybe_command = receiver.recv().fuse() => {
-                    match maybe_command {
-                        Some(command) => if let Err(err) = self.handle_command(command).await {
-                            error!("error handling command {}", err);
-                        }
-                        None => {
-                            break;
-                        }
+                        // TODO: handle_disconnect
+                    } else {
+                        self.handler.connection.enqueue_write_op(&ClientOp::Ping);
                     }
                 }
 
-                maybe_op_result = self.connection.read_op().fuse() => {
-                    match maybe_op_result {
-                        Ok(Some(server_op)) => if let Err(err) = self.handle_server_op(server_op).await {
-                            error!("error handling operation {}", err);
-                        }
-                        Ok(None) => {
-                            if let Err(err) = self.handle_disconnect().await {
-                                error!("error handling operation {}", err);
-                            }
-                        }
-                        Err(op_err) => {
-                            if let Err(err) = self.handle_disconnect().await {
-                                error!("error reconnecting {}. original error={}", err, op_err);
-                            }
-                        },
+                match self.receiver.poll_recv(cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(Some(cmd)) => {
+                        self.handler.handle_command(cmd);
+                    }
+                    Poll::Ready(None) => return Poll::Ready(Ok(())),
+                }
+
+                match self.handler.connection.poll_read_op(cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(Some(server_op))) => {
+                        self.handler.handle_server_op(server_op);
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        // TODO: handle_disconnect
+                    }
+                    Poll::Ready(Err(_err)) => {
+                        // TODO: handle_disconnect
                     }
                 }
+
+                match self.handler.connection.poll_write(cx) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(_err)) => {
+                        // TODO: handle_disconnect
+                    }
+                }
+
+                self.handler.connection.poll_flush(cx)
             }
         }
 
-        self.handle_flush().await?;
-
-        Ok(())
+        ProcessFut {
+            handler: self,
+            receiver,
+        }
     }
 
-    async fn handle_server_op(&mut self, server_op: ServerOp) -> Result<(), io::Error> {
+    fn handle_server_op(&mut self, server_op: ServerOp) {
         self.ping_interval.reset();
 
         match server_op {
             ServerOp::Ping => {
-                self.connection.write_op(&ClientOp::Pong).await?;
-                self.handle_flush().await?;
+                self.connection.enqueue_write_op(&ClientOp::Pong);
             }
             ServerOp::Pong => {
                 debug!("received PONG");
                 self.pending_pings = self.pending_pings.saturating_sub(1);
             }
             ServerOp::Error(error) => {
-                self.connector
-                    .events_tx
-                    .try_send(Event::ServerError(error))
-                    .ok();
+                let _ = self.connector.events_tx.try_send(Event::ServerError(error));
             }
             ServerOp::Message {
                 sid,
@@ -469,18 +456,12 @@ impl ConnectionHandler {
                             }
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            self.connector
-                                .events_tx
-                                .send(Event::SlowConsumer(sid))
-                                .await
-                                .ok();
+                            let _ = self.connector.events_tx.try_send(Event::SlowConsumer(sid));
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             self.subscriptions.remove(&sid);
                             self.connection
-                                .write_op(&ClientOp::Unsubscribe { sid, max: None })
-                                .await?;
-                            self.handle_flush().await?;
+                                .enqueue_write_op(&ClientOp::Unsubscribe { sid, max: None });
                         }
                     }
                 }
@@ -488,11 +469,7 @@ impl ConnectionHandler {
             // TODO: we should probably update advertised server list here too.
             ServerOp::Info(info) => {
                 if info.lame_duck_mode {
-                    self.connector
-                        .events_tx
-                        .send(Event::LameDuckMode)
-                        .await
-                        .ok();
+                    let _ = self.connector.events_tx.send(Event::LameDuckMode);
                 }
             }
 
@@ -500,18 +477,9 @@ impl ConnectionHandler {
                 // TODO: don't ignore.
             }
         }
-
-        Ok(())
     }
 
-    async fn handle_flush(&mut self) -> Result<(), io::Error> {
-        self.connection.flush().await?;
-        self.flush_interval.reset();
-
-        Ok(())
-    }
-
-    async fn handle_command(&mut self, command: Command) -> Result<(), io::Error> {
+    fn handle_command(&mut self, command: Command) {
         self.ping_interval.reset();
 
         match command {
@@ -529,38 +497,9 @@ impl ConnectionHandler {
                         }
                     }
 
-                    if let Err(err) = self
-                        .connection
-                        .write_op(&ClientOp::Unsubscribe { sid, max })
-                        .await
-                    {
-                        error!("Send failed with {:?}", err);
-                    }
+                    self.connection
+                        .enqueue_write_op(&ClientOp::Unsubscribe { sid, max });
                 }
-            }
-            Command::Flush { result } => {
-                if let Err(_err) = self.handle_flush().await {
-                    if let Err(err) = self.handle_disconnect().await {
-                        result.send(Err(err)).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
-                        })?;
-                    } else if let Err(err) = self.handle_flush().await {
-                        result.send(Err(err)).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
-                        })?;
-                    } else {
-                        result.send(Ok(())).map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
-                        })?;
-                    }
-                } else {
-                    result.send(Ok(())).map_err(|_| {
-                        io::Error::new(io::ErrorKind::Other, "one shot failed to be received")
-                    })?;
-                }
-            }
-            Command::TryFlush => {
-                self.handle_flush().await?;
             }
             Command::Subscribe {
                 sid,
@@ -578,17 +517,11 @@ impl ConnectionHandler {
 
                 self.subscriptions.insert(sid, subscription);
 
-                if let Err(err) = self
-                    .connection
-                    .write_op(&ClientOp::Subscribe {
-                        sid,
-                        subject,
-                        queue_group,
-                    })
-                    .await
-                {
-                    error!("Sending Subscribe failed with {:?}", err);
-                }
+                self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                    sid,
+                    subject,
+                    queue_group,
+                });
             }
             Command::Publish {
                 subject,
@@ -596,20 +529,14 @@ impl ConnectionHandler {
                 respond,
                 headers,
             } => {
-                let pub_op = ClientOp::Publish {
+                self.connection.enqueue_write_op(&ClientOp::Publish {
                     subject,
                     payload,
                     respond,
                     headers,
-                };
-                while let Err(err) = self.connection.write_op(&pub_op).await {
-                    self.handle_disconnect().await?;
-                    error!("Sending Publish failed with {:?}", err);
-                }
+                });
             }
         }
-
-        Ok(())
     }
 
     async fn handle_disconnect(&mut self) -> io::Result<()> {
@@ -635,14 +562,11 @@ impl ConnectionHandler {
             .retain(|_, subscription| !subscription.sender.is_closed());
 
         for (sid, subscription) in &self.subscriptions {
-            self.connection
-                .write_op(&ClientOp::Subscribe {
-                    sid: *sid,
-                    subject: subscription.subject.to_owned(),
-                    queue_group: subscription.queue_group.to_owned(),
-                })
-                .await
-                .unwrap();
+            self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                sid: *sid,
+                subject: subscription.subject.to_owned(),
+                queue_group: subscription.queue_group.to_owned(),
+            });
         }
         self.connector.events_tx.try_send(Event::Connected).ok();
 
@@ -670,7 +594,6 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     options: ConnectOptions,
 ) -> Result<Client, ConnectError> {
     let ping_period = options.ping_interval;
-    let flush_period = options.flush_interval;
 
     let (events_tx, mut events_rx) = mpsc::channel(128);
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
@@ -708,7 +631,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     }
 
     let (info_sender, info_watcher) = tokio::sync::watch::channel(info);
-    let (sender, receiver) = mpsc::channel(options.sender_capacity);
+    let (sender, mut receiver) = mpsc::channel(options.sender_capacity);
 
     let client = Client::new(
         info_watcher,
@@ -732,14 +655,9 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             connection = Some(connection_ok);
         }
         let connection = connection.unwrap();
-        let mut connection_handler = ConnectionHandler::new(
-            connection,
-            connector,
-            info_sender,
-            ping_period,
-            flush_period,
-        );
-        connection_handler.process(receiver).await
+        let mut connection_handler =
+            ConnectionHandler::new(connection, connector, info_sender, ping_period);
+        connection_handler.process(&mut receiver).await
     });
 
     Ok(client)
