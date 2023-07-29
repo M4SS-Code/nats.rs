@@ -239,6 +239,7 @@ impl Connector {
 
                         connection.enqueue_write_op(&ClientOp::Connect(connect_info));
                         connection.enqueue_write_op(&ClientOp::Ping);
+                        future::poll_fn(|cx| connection.poll_write(cx)).await?;
                         future::poll_fn(|cx| connection.poll_flush(cx)).await?;
 
                         match connection.read_op().await? {
