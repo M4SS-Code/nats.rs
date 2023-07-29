@@ -397,35 +397,37 @@ impl Connection {
         }
     }
 
-    pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let mut written = 0;
+    pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.write_waker = Some(cx.waker().clone());
 
         loop {
-            let next_write = match self.write_buffer.back_mut() {
+            let next_write = match self.write_buffer.front_mut() {
                 Some(next_write) => next_write,
-                None => return Poll::Ready(Ok(written)),
+                None => return Poll::Ready(Ok(())),
             };
 
             match next_write {
-                WriteOrFlush::Write(buf) => match Pin::new(&mut self.stream).poll_write(cx, buf) {
-                    Poll::Pending if written == 0 => return Poll::Pending,
-                    Poll::Pending => return Poll::Ready(Ok(written)),
-                    Poll::Ready(Ok(n)) => {
-                        if n < buf.len() {
-                            buf.advance(n);
-                        } else {
-                            self.write_buffer.pop_back();
-                        }
-                        self.write_buffer_len -= n;
-                        written += n;
+                WriteOrFlush::Write(buf) => {
+                    debug_assert!(!buf.is_empty());
 
-                        continue;
+                    match Pin::new(&mut self.stream).poll_write(cx, buf) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(n)) => {
+                            if n < buf.len() {
+                                buf.advance(n);
+                            } else {
+                                self.write_buffer.pop_front();
+                            }
+                            self.write_buffer_len -= n;
+
+                            continue;
+                        }
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                },
+                }
                 WriteOrFlush::Flush => {
                     self.needs_flush = true;
+                    self.write_buffer.pop_front();
                 }
             }
         }

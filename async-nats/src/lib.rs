@@ -408,8 +408,7 @@ impl ConnectionHandler {
 
                     match self.handler.connection.poll_write(cx) {
                         Poll::Pending => break,
-                        Poll::Ready(Ok(0)) => break,
-                        Poll::Ready(Ok(_n)) => {}
+                        Poll::Ready(Ok(())) => {}
                         Poll::Ready(Err(err)) => {
                             return Poll::Ready(ExitReason::Disconnected(Some(err)))
                         }
