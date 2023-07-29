@@ -242,7 +242,6 @@ mod service {
             .publish_with_reply("products".to_string(), reply.clone(), "data".into())
             .await
             .unwrap();
-        client.flush().await.unwrap();
 
         // respond with 3 Oks.
         while let Some(request) = endpoint.next().await {
