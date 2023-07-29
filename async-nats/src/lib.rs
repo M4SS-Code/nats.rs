@@ -368,23 +368,34 @@ impl ConnectionHandler {
             Closed,
         }
 
+        impl<'a> ProcessFut<'a> {
+            #[cold]
+            fn ping(&mut self) -> Poll<ExitReason> {
+                self.handler.pending_pings += 1;
+
+                if self.handler.pending_pings > MAX_PENDING_PINGS {
+                    debug!(
+                        "pending pings {}, max pings {}. disconnecting",
+                        self.handler.pending_pings, MAX_PENDING_PINGS
+                    );
+
+                    Poll::Ready(ExitReason::Disconnected(None))
+                } else {
+                    self.handler.connection.enqueue_write_op(&ClientOp::Ping);
+                    self.handler.is_flushing = true;
+
+                    Poll::Pending
+                }
+            }
+        }
+
         impl<'a> Future for ProcessFut<'a> {
             type Output = ExitReason;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 if self.handler.ping_interval.poll_tick(cx).is_ready() {
-                    self.handler.pending_pings += 1;
-
-                    if self.handler.pending_pings > MAX_PENDING_PINGS {
-                        debug!(
-                            "pending pings {}, max pings {}. disconnecting",
-                            self.handler.pending_pings, MAX_PENDING_PINGS
-                        );
-
-                        return Poll::Ready(ExitReason::Disconnected(None));
-                    } else {
-                        self.handler.connection.enqueue_write_op(&ClientOp::Ping);
-                        self.handler.is_flushing = true;
+                    if let Poll::Ready(exit) = self.ping() {
+                        return Poll::Ready(exit);
                     }
                 }
 
