@@ -434,6 +434,14 @@ impl Connection {
         self.write_buffer_len < self.soft_write_buffer_capacity
     }
 
+    #[cfg(test)]
+    async fn write_op(&mut self, item: &ClientOp) -> io::Result<()> {
+        self.enqueue_write_op(item);
+        future::poll_fn(|cx| self.poll_write(cx)).await?;
+        future::poll_fn(|cx| self.poll_flush(cx)).await?;
+        Ok(())
+    }
+
     /// Writes a client operation to the write buffer.
     pub(crate) fn enqueue_write_op<'a>(&mut self, item: &ClientOp) {
         match item {
@@ -560,7 +568,7 @@ mod read_op {
     #[tokio::test]
     async fn ok() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"+OK\r\n").await.unwrap();
         let result = connection.read_op().await.unwrap();
@@ -570,7 +578,7 @@ mod read_op {
     #[tokio::test]
     async fn ping() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"PING\r\n").await.unwrap();
         let result = connection.read_op().await.unwrap();
@@ -580,7 +588,7 @@ mod read_op {
     #[tokio::test]
     async fn pong() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"PONG\r\n").await.unwrap();
         let result = connection.read_op().await.unwrap();
@@ -590,7 +598,7 @@ mod read_op {
     #[tokio::test]
     async fn info() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"INFO {}\r\n").await.unwrap();
         server.flush().await.unwrap();
@@ -617,7 +625,7 @@ mod read_op {
     #[tokio::test]
     async fn error() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"INFO {}\r\n").await.unwrap();
         let result = connection.read_op().await.unwrap();
@@ -639,7 +647,7 @@ mod read_op {
     #[tokio::test]
     async fn message() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server
             .write_all(b"MSG FOO.BAR 9 11\r\nHello World\r\n")
@@ -786,7 +794,7 @@ mod read_op {
     #[tokio::test]
     async fn unknown() {
         let (stream, mut server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         server.write_all(b"ONE\r\n").await.unwrap();
         connection.read_op().await.unwrap_err();
@@ -838,13 +846,12 @@ mod read_op {
 mod write_op {
     use super::Connection;
     use crate::{ClientOp, ConnectInfo, HeaderMap, Protocol};
-    use bytes::BytesMut;
     use tokio::io::{self, AsyncBufReadExt, BufReader};
 
     #[tokio::test]
     async fn publish() {
         let (stream, server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         connection
             .write_op(&ClientOp::Publish {
@@ -855,7 +862,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         let mut buffer = String::new();
         let mut reader = BufReader::new(server);
@@ -872,7 +878,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
@@ -891,7 +896,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
@@ -907,7 +911,7 @@ mod write_op {
     #[tokio::test]
     async fn subscribe() {
         let (stream, server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         connection
             .write_op(&ClientOp::Subscribe {
@@ -917,7 +921,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         let mut buffer = String::new();
         let mut reader = BufReader::new(server);
@@ -932,7 +935,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
@@ -942,13 +944,12 @@ mod write_op {
     #[tokio::test]
     async fn unsubscribe() {
         let (stream, server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         connection
             .write_op(&ClientOp::Unsubscribe { sid: 11, max: None })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         let mut buffer = String::new();
         let mut reader = BufReader::new(server);
@@ -962,7 +963,6 @@ mod write_op {
             })
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         buffer.clear();
         reader.read_line(&mut buffer).await.unwrap();
@@ -972,13 +972,12 @@ mod write_op {
     #[tokio::test]
     async fn ping() {
         let (stream, server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         let mut reader = BufReader::new(server);
         let mut buffer = String::new();
 
         connection.write_op(&ClientOp::Ping).await.unwrap();
-        connection.flush().await.unwrap();
 
         reader.read_line(&mut buffer).await.unwrap();
 
@@ -988,13 +987,12 @@ mod write_op {
     #[tokio::test]
     async fn pong() {
         let (stream, server) = io::duplex(128);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         let mut reader = BufReader::new(server);
         let mut buffer = String::new();
 
         connection.write_op(&ClientOp::Pong).await.unwrap();
-        connection.flush().await.unwrap();
 
         reader.read_line(&mut buffer).await.unwrap();
 
@@ -1004,7 +1002,7 @@ mod write_op {
     #[tokio::test]
     async fn connect() {
         let (stream, server) = io::duplex(1024);
-        let mut connection = Connection::new(Box::new(stream), 0);
+        let mut connection = Connection::new(Box::new(stream), 0, 8196);
 
         let mut reader = BufReader::new(server);
         let mut buffer = String::new();
@@ -1030,7 +1028,6 @@ mod write_op {
             }))
             .await
             .unwrap();
-        connection.flush().await.unwrap();
 
         reader.read_line(&mut buffer).await.unwrap();
         assert_eq!(
