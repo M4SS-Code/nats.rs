@@ -41,7 +41,6 @@ mod jetstream {
     use async_nats::jetstream::stream::{self, DiscardPolicy, StorageType};
     use async_nats::jetstream::AckKind;
     use async_nats::ConnectOptions;
-    use bytes::Bytes;
     use futures::stream::{StreamExt, TryStreamExt};
     use time::OffsetDateTime;
     use tokio_retry::Retry;
@@ -1190,7 +1189,7 @@ mod jetstream {
         let mut iter = consumer.sequence(50).unwrap().take(10);
         while let Ok(Some(mut batch)) = iter.try_next().await {
             while let Ok(Some(message)) = batch.try_next().await {
-                assert_eq!(message.payload, Bytes::from(b"dat".as_ref()));
+                assert_eq!(message.payload, bytes::Bytes::from(b"dat".as_ref()));
             }
         }
     }
@@ -1633,6 +1632,35 @@ mod jetstream {
             seen += 1;
         }
         assert_eq!(seen, 1000);
+
+        let consumer = stream
+            .create_consumer(consumer::push::Config {
+                deliver_subject: "delivery".to_string(),
+                durable_name: Some("delete_me".to_string()),
+                idle_heartbeat: Duration::from_secs(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        stream.delete_consumer("delete_me").await.unwrap();
+
+        let mut messages = consumer.messages().await.unwrap();
+        assert_eq!(
+            messages.next().await.unwrap().unwrap_err().kind(),
+            async_nats::jetstream::consumer::push::MessagesErrorKind::MissingHeartbeat
+        );
+        stream
+            .create_consumer(consumer::push::Config {
+                deliver_subject: "delivery".to_string(),
+                durable_name: Some("delete_me".to_string()),
+                idle_heartbeat: Duration::from_secs(5),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        messages.next().await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2109,11 +2137,7 @@ mod jetstream {
     #[cfg(feature = "slow_tests")]
     #[tokio::test]
     async fn pull_consumer_stream_with_heartbeat() {
-        tracing_subscriber::fmt()
-            .with_max_level(Level::DEBUG)
-            .init();
-
-        use tracing::{debug, Level};
+        use tracing::debug;
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = ConnectOptions::new()
             .event_callback(|err| async move { println!("error: {err:?}") })
