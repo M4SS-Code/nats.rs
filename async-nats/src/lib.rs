@@ -396,6 +396,11 @@ impl ConnectionHandler {
                     }
                 }
 
+                // WARNING: after the following loop `handle_command`,
+                // or other functions which call `enqueue_write_op`,
+                // cannot be called anymore. Runtime wakeups won't
+                // trigger a call to `poll_write`
+
                 let mut made_progress = true;
                 loop {
                     while self.handler.connection.should_send_more_write_ops() {

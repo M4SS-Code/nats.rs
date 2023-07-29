@@ -18,7 +18,7 @@ use std::fmt::Display;
 use std::future::{self, Future};
 use std::pin::Pin;
 use std::str::{self, FromStr};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use tokio::io::AsyncRead;
 use tokio::io::{AsyncReadExt, AsyncWrite};
@@ -63,7 +63,6 @@ pub(crate) struct Connection {
     write_buffer_len: usize,
     soft_write_buffer_capacity: usize,
     needs_flush: bool,
-    write_waker: Option<Waker>,
 }
 
 pub(crate) enum WriteOrFlush {
@@ -86,7 +85,6 @@ impl Connection {
             write_buffer_len: 0,
             soft_write_buffer_capacity,
             needs_flush: false,
-            write_waker: None,
         }
     }
 
@@ -398,8 +396,6 @@ impl Connection {
     }
 
     pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.write_waker = Some(cx.waker().clone());
-
         loop {
             let next_write = match self.write_buffer.front_mut() {
                 Some(next_write) => next_write,
@@ -531,9 +527,6 @@ impl Connection {
         }
 
         self.write_buffer.push_back(WriteOrFlush::Flush);
-        if let Some(waker) = self.write_waker.take() {
-            waker.wake();
-        }
     }
 
     fn write(&mut self, buf: impl Into<Bytes>) {
