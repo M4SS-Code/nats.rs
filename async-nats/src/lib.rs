@@ -396,22 +396,31 @@ impl ConnectionHandler {
                 }
 
                 loop {
-                    if self.handler.connection.should_send_more_write_ops() {
+                    let mut made_progress = false;
+
+                    while self.handler.connection.should_send_more_write_ops() {
                         match self.receiver.poll_recv(cx) {
-                            Poll::Pending => {}
+                            Poll::Pending => break,
                             Poll::Ready(Some(cmd)) => {
+                                made_progress = true;
                                 self.handler.handle_command(cmd);
                             }
                             Poll::Ready(None) => return Poll::Ready(ExitReason::Closed),
                         }
                     }
 
-                    match self.handler.connection.poll_write(cx) {
-                        Poll::Pending => break,
-                        Poll::Ready(Ok(())) => {}
-                        Poll::Ready(Err(err)) => {
-                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                    loop {
+                        match self.handler.connection.poll_write(cx) {
+                            Poll::Pending => break,
+                            Poll::Ready(Ok(())) => break,
+                            Poll::Ready(Err(err)) => {
+                                return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                            }
                         }
+                    }
+
+                    if !made_progress {
+                        break;
                     }
                 }
 
