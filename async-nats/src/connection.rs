@@ -443,7 +443,7 @@ impl Connection {
     }
 
     /// Writes a client operation to the write buffer.
-    pub(crate) fn enqueue_write_op<'a>(&mut self, item: &ClientOp) {
+    pub(crate) fn enqueue_write_op(&mut self, item: &ClientOp) {
         match item {
             ClientOp::Connect(connect_info) => {
                 let json =

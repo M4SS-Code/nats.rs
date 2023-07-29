@@ -533,7 +533,7 @@ impl ConnectionHandler {
             // TODO: we should probably update advertised server list here too.
             ServerOp::Info(info) => {
                 if info.lame_duck_mode {
-                    let _ = self.connector.events_tx.send(Event::LameDuckMode);
+                    let _ = self.connector.events_tx.try_send(Event::LameDuckMode);
                 }
             }
 
