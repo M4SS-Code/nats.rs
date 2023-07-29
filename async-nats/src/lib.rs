@@ -317,6 +317,7 @@ pub(crate) struct ConnectionHandler {
     pending_pings: usize,
     info_sender: tokio::sync::watch::Sender<ServerInfo>,
     ping_interval: Interval,
+    flush_interval: Option<Interval>,
 }
 
 impl ConnectionHandler {
@@ -325,9 +326,16 @@ impl ConnectionHandler {
         connector: Connector,
         info_sender: tokio::sync::watch::Sender<ServerInfo>,
         ping_period: Duration,
+        flush_period: Duration,
     ) -> ConnectionHandler {
         let mut ping_interval = interval(ping_period);
         ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let flush_interval = (!flush_period.is_zero()).then(|| {
+            let mut interval = interval(flush_period);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            interval
+        });
 
         ConnectionHandler {
             connection,
@@ -336,6 +344,7 @@ impl ConnectionHandler {
             pending_pings: 0,
             info_sender,
             ping_interval,
+            flush_interval,
         }
     }
 
@@ -346,6 +355,7 @@ impl ConnectionHandler {
         struct ProcessFut<'a> {
             handler: &'a mut ConnectionHandler,
             receiver: &'a mut mpsc::Receiver<Command>,
+            is_flushing: bool,
         }
 
         impl<'a> Future for ProcessFut<'a> {
@@ -396,13 +406,31 @@ impl ConnectionHandler {
                     }
                 }
 
-                self.handler.connection.poll_flush(cx)
+                if !self.is_flushing && self.handler.connection.needs_flush() {
+                    self.is_flushing = match &mut self.handler.flush_interval {
+                        Some(flush_interval) => flush_interval.poll_tick(cx).is_ready(),
+                        None => true,
+                    };
+                }
+
+                if self.is_flushing {
+                    match self.handler.connection.poll_flush(cx) {
+                        Poll::Pending => {}
+                        Poll::Ready(Ok(())) => {
+                            self.is_flushing = false;
+                        }
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    }
+                }
+
+                Poll::Pending
             }
         }
 
         ProcessFut {
             handler: self,
             receiver,
+            is_flushing: false,
         }
     }
 
@@ -594,6 +622,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     options: ConnectOptions,
 ) -> Result<Client, ConnectError> {
     let ping_period = options.ping_interval;
+    let flush_period = options.flush_interval;
 
     let (events_tx, mut events_rx) = mpsc::channel(128);
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
@@ -655,8 +684,13 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             connection = Some(connection_ok);
         }
         let connection = connection.unwrap();
-        let mut connection_handler =
-            ConnectionHandler::new(connection, connector, info_sender, ping_period);
+        let mut connection_handler = ConnectionHandler::new(
+            connection,
+            connector,
+            info_sender,
+            ping_period,
+            flush_period,
+        );
         connection_handler.process(&mut receiver).await
     });
 

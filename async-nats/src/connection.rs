@@ -25,7 +25,6 @@ use tokio::io::{AsyncReadExt, AsyncWrite};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io;
-use tracing::warn;
 
 use crate::header::{HeaderMap, HeaderName};
 use crate::status::StatusCode;
@@ -80,6 +79,10 @@ impl Connection {
             needs_flush: false,
             write_waker: None,
         }
+    }
+
+    pub(crate) fn needs_flush(&self) -> bool {
+        self.needs_flush
     }
 
     /// Attempts to read a server operation from the read buffer.
@@ -391,12 +394,12 @@ impl Connection {
         loop {
             let next_write = match self.write_buffer.back_mut() {
                 Some(next_write) => next_write,
-                None => return Poll::Pending,
+                None => return Poll::Ready(Ok(())),
             };
 
             match next_write {
                 WriteOrFlush::Write(buf) => match Pin::new(&mut self.stream).poll_write(cx, buf) {
-                    Poll::Pending => return Poll::Ready(Ok(())),
+                    Poll::Pending => return Poll::Pending,
                     Poll::Ready(Ok(n)) => {
                         if n < buf.len() {
                             buf.advance(n);
@@ -517,7 +520,6 @@ impl Connection {
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.needs_flush {
-            warn!("Connection::poll_flush called when flushing wasn't needed");
             return Poll::Ready(Ok(()));
         }
 
