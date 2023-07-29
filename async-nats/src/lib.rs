@@ -129,6 +129,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::iter;
+use std::mem;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::option;
 use std::pin::Pin;
@@ -395,9 +396,8 @@ impl ConnectionHandler {
                     }
                 }
 
+                let mut made_progress = true;
                 loop {
-                    let mut made_progress = false;
-
                     while self.handler.connection.should_send_more_write_ops() {
                         match self.receiver.poll_recv(cx) {
                             Poll::Pending => break,
@@ -409,18 +409,32 @@ impl ConnectionHandler {
                         }
                     }
 
-                    loop {
-                        match self.handler.connection.poll_write(cx) {
-                            Poll::Pending => break,
-                            Poll::Ready(Ok(())) => break,
-                            Poll::Ready(Err(err)) => {
-                                return Poll::Ready(ExitReason::Disconnected(Some(err)))
-                            }
-                        }
+                    // The first round will poll both from
+                    // the `receiver` and the writer, giving
+                    // them both a chance to make progress
+                    // and register `Waker`s.
+                    //
+                    // If writing is `Poll::Pending` we exit.
+                    //
+                    // If writing is completed we can repeat the entire
+                    // cycle as long as the `receiver` doesn't end-up
+                    // `Poll::Pending` immediately.
+                    if !mem::take(&mut made_progress) {
+                        break;
                     }
 
-                    if !made_progress {
-                        break;
+                    match self.handler.connection.poll_write(cx) {
+                        Poll::Pending => {
+                            // Write buffer couldn't be fully emptied
+                            break
+                        },
+                        Poll::Ready(Ok(())) => {
+                            // Write buffer is empty
+                            continue;
+                        },
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                        }
                     }
                 }
 
