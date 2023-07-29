@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::trace;
 
 static VERSION_RE: Lazy<Regex> =
@@ -473,18 +473,14 @@ impl Client {
     /// # }
     /// ```
     pub async fn flush(&self) -> Result<(), FlushError> {
-        /*
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         self.sender
-            .send(Command::Flush { result: tx })
+            .send(Command::Flush { observer: tx })
             .await
             .map_err(|err| FlushError::with_source(FlushErrorKind::SendError, err))?;
-        // first question mark is an error from rx itself, second for error from flush.
+
         rx.await
-            .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?;
-        Ok(())
-        */
         Ok(())
     }
 

@@ -122,6 +122,7 @@
 use thiserror::Error;
 
 use futures::stream::Stream;
+use tokio::sync::oneshot;
 use tracing::{debug, error};
 
 use core::fmt;
@@ -276,6 +277,9 @@ pub(crate) enum Command {
         sid: u64,
         max: Option<u64>,
     },
+    Flush {
+        observer: oneshot::Sender<()>,
+    },
 }
 
 /// `ClientOp` represents all actions of `Client`.
@@ -319,6 +323,8 @@ pub(crate) struct ConnectionHandler {
     info_sender: tokio::sync::watch::Sender<ServerInfo>,
     ping_interval: Interval,
     flush_interval: Option<Interval>,
+    is_flushing: bool,
+    flush_observers: Vec<oneshot::Sender<()>>,
 }
 
 impl ConnectionHandler {
@@ -346,6 +352,8 @@ impl ConnectionHandler {
             info_sender,
             ping_interval,
             flush_interval,
+            is_flushing: false,
+            flush_observers: Vec::new(),
         }
     }
 
@@ -353,7 +361,6 @@ impl ConnectionHandler {
         struct ProcessFut<'a> {
             handler: &'a mut ConnectionHandler,
             receiver: &'a mut mpsc::Receiver<Command>,
-            is_flushing: bool,
         }
 
         enum ExitReason {
@@ -377,7 +384,7 @@ impl ConnectionHandler {
                         return Poll::Ready(ExitReason::Disconnected(None));
                     } else {
                         self.handler.connection.enqueue_write_op(&ClientOp::Ping);
-                        self.is_flushing = true;
+                        self.handler.is_flushing = true;
                     }
                 }
 
@@ -443,18 +450,22 @@ impl ConnectionHandler {
                     }
                 }
 
-                if !self.is_flushing && self.handler.connection.needs_flush() {
-                    self.is_flushing = match &mut self.handler.flush_interval {
+                if !self.handler.is_flushing && self.handler.connection.needs_flush() {
+                    self.handler.is_flushing = match &mut self.handler.flush_interval {
                         Some(flush_interval) => flush_interval.poll_tick(cx).is_ready(),
                         None => true,
                     };
                 }
 
-                if self.is_flushing {
+                if self.handler.is_flushing {
                     match self.handler.connection.poll_flush(cx) {
                         Poll::Pending => {}
                         Poll::Ready(Ok(())) => {
-                            self.is_flushing = false;
+                            self.handler.is_flushing = false;
+
+                            for observer in self.handler.flush_observers.drain(..) {
+                                let _ = observer.send(());
+                            }
                         }
                         Poll::Ready(Err(err)) => {
                             return Poll::Ready(ExitReason::Disconnected(Some(err)))
@@ -470,7 +481,6 @@ impl ConnectionHandler {
             let process = ProcessFut {
                 handler: self,
                 receiver,
-                is_flushing: false,
             };
             match process.await {
                 ExitReason::Disconnected(err) => {
@@ -613,6 +623,10 @@ impl ConnectionHandler {
                     respond,
                     headers,
                 });
+            }
+            Command::Flush { observer } => {
+                self.is_flushing = true;
+                self.flush_observers.push(observer);
             }
         }
     }
