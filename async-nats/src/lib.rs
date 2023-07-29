@@ -996,15 +996,10 @@ impl From<tokio::sync::mpsc::error::SendError<Command>> for UnsubscribeError {
 impl Drop for Subscriber {
     fn drop(&mut self) {
         self.receiver.close();
-        tokio::spawn({
-            let sender = self.sender.clone();
-            let sid = self.sid;
-            async move {
-                sender
-                    .send(Command::Unsubscribe { sid, max: None })
-                    .await
-                    .ok();
-            }
+
+        let _ = self.sender.try_send(Command::Unsubscribe {
+            sid: self.sid,
+            max: None,
         });
     }
 }
