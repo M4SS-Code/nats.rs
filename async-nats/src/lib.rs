@@ -426,12 +426,12 @@ impl ConnectionHandler {
                     match self.handler.connection.poll_write(cx) {
                         Poll::Pending => {
                             // Write buffer couldn't be fully emptied
-                            break
-                        },
+                            break;
+                        }
                         Poll::Ready(Ok(())) => {
                             // Write buffer is empty
                             continue;
-                        },
+                        }
                         Poll::Ready(Err(err)) => {
                             return Poll::Ready(ExitReason::Disconnected(Some(err)))
                         }
