@@ -136,7 +136,7 @@ use std::slice;
 use std::str::{self, FromStr};
 use std::task::{Context, Poll};
 use tokio::io::ErrorKind;
-use tokio::time::{interval, Duration, Interval, MissedTickBehavior};
+use tokio::time::{interval, sleep, Duration, Interval, MissedTickBehavior};
 use url::{Host, Url};
 
 use bytes::Bytes;
@@ -348,18 +348,20 @@ impl ConnectionHandler {
         }
     }
 
-    pub(crate) fn process<'a>(
-        &'a mut self,
-        receiver: &'a mut mpsc::Receiver<Command>,
-    ) -> impl Future<Output = io::Result<()>> + 'a {
+    pub(crate) async fn process<'a>(&'a mut self, receiver: &'a mut mpsc::Receiver<Command>) {
         struct ProcessFut<'a> {
             handler: &'a mut ConnectionHandler,
             receiver: &'a mut mpsc::Receiver<Command>,
             is_flushing: bool,
         }
 
+        enum ExitReason {
+            Disconnected(Option<io::Error>),
+            Closed,
+        }
+
         impl<'a> Future for ProcessFut<'a> {
-            type Output = io::Result<()>;
+            type Output = ExitReason;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 if self.handler.ping_interval.poll_tick(cx).is_ready() {
@@ -371,7 +373,7 @@ impl ConnectionHandler {
                             self.handler.pending_pings, MAX_PENDING_PINGS
                         );
 
-                        // TODO: handle_disconnect and wake `cx`
+                        return Poll::Ready(ExitReason::Disconnected(None));
                     } else {
                         self.handler.connection.enqueue_write_op(&ClientOp::Ping);
                         self.is_flushing = true;
@@ -385,10 +387,10 @@ impl ConnectionHandler {
                             self.handler.handle_server_op(server_op);
                         }
                         Poll::Ready(Ok(None)) => {
-                            // TODO: handle_disconnect and wake `cx`
+                            return Poll::Ready(ExitReason::Disconnected(None))
                         }
-                        Poll::Ready(Err(_err)) => {
-                            // TODO: handle_disconnect and wake `cx`
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
                         }
                     }
                 }
@@ -400,7 +402,7 @@ impl ConnectionHandler {
                             Poll::Ready(Some(cmd)) => {
                                 self.handler.handle_command(cmd);
                             }
-                            Poll::Ready(None) => return Poll::Ready(Ok(())),
+                            Poll::Ready(None) => return Poll::Ready(ExitReason::Closed),
                         }
                     }
 
@@ -408,8 +410,8 @@ impl ConnectionHandler {
                         Poll::Pending => break,
                         Poll::Ready(Ok(0)) => break,
                         Poll::Ready(Ok(_n)) => {}
-                        Poll::Ready(Err(_err)) => {
-                            // TODO: handle_disconnect and wake `cx`
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
                         }
                     }
                 }
@@ -427,7 +429,9 @@ impl ConnectionHandler {
                         Poll::Ready(Ok(())) => {
                             self.is_flushing = false;
                         }
-                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                        Poll::Ready(Err(err)) => {
+                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                        }
                     }
                 }
 
@@ -435,10 +439,34 @@ impl ConnectionHandler {
             }
         }
 
-        ProcessFut {
-            handler: self,
-            receiver,
-            is_flushing: false,
+        loop {
+            let process = ProcessFut {
+                handler: self,
+                receiver,
+                is_flushing: false,
+            };
+            match process.await {
+                ExitReason::Disconnected(err) => {
+                    debug!(?err, "disconnected");
+
+                    let mut retry_after = Duration::from_millis(500);
+                    loop {
+                        match self.handle_disconnect().await {
+                            Ok(()) => {
+                                debug!("reconnected");
+                                break;
+                            }
+                            Err(err) => {
+                                debug!(?err, "reconnect failed");
+
+                                sleep(retry_after).await;
+                                retry_after = (retry_after * 2).min(Duration::from_secs(30));
+                            }
+                        }
+                    }
+                }
+                ExitReason::Closed => break,
+            }
         }
     }
 
