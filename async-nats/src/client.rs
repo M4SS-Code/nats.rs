@@ -485,7 +485,7 @@ impl Client {
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?;
         Ok(())
         */
-        todo!()
+        Ok(())
     }
 
     /// Returns the current state of the connection.
