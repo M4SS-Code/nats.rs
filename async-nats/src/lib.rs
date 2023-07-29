@@ -136,7 +136,7 @@ use std::slice;
 use std::str::{self, FromStr};
 use std::task::{Context, Poll};
 use tokio::io::ErrorKind;
-use tokio::time::{interval, sleep, Duration, Interval, MissedTickBehavior};
+use tokio::time::{interval, Duration, Interval, MissedTickBehavior};
 use url::{Host, Url};
 
 use bytes::Bytes;
@@ -448,21 +448,8 @@ impl ConnectionHandler {
                 ExitReason::Disconnected(err) => {
                     debug!(?err, "disconnected");
 
-                    let mut retry_after = Duration::from_millis(500);
-                    loop {
-                        match self.handle_disconnect().await {
-                            Ok(()) => {
-                                debug!("reconnected");
-                                break;
-                            }
-                            Err(err) => {
-                                debug!(?err, "reconnect failed");
-
-                                sleep(retry_after).await;
-                                retry_after = (retry_after * 2).min(Duration::from_secs(30));
-                            }
-                        }
-                    }
+                    self.handle_disconnect().await;
+                    debug!("reconnected");
                 }
                 ExitReason::Closed => break,
             }
@@ -602,24 +589,18 @@ impl ConnectionHandler {
         }
     }
 
-    async fn handle_disconnect(&mut self) -> io::Result<()> {
+    async fn handle_disconnect(&mut self) {
         self.pending_pings = 0;
-        self.connector.events_tx.try_send(Event::Disconnected).ok();
-        self.connector.state_tx.send(State::Disconnected).ok();
-        self.handle_reconnect().await?;
+        let _ = self.connector.events_tx.try_send(Event::Disconnected);
+        let _ = self.connector.state_tx.send(State::Disconnected);
 
-        Ok(())
+        self.handle_reconnect().await;
     }
 
-    async fn handle_reconnect(&mut self) -> Result<(), io::Error> {
-        let (info, connection) = self.connector.connect().await?;
+    async fn handle_reconnect(&mut self) {
+        let (info, connection) = self.connector.connect().await;
         self.connection = connection;
-        self.info_sender.send(info).map_err(|err| {
-            std::io::Error::new(
-                ErrorKind::Other,
-                format!("failed to send info update: {err}"),
-            )
-        })?;
+        let _ = self.info_sender.send(info);
 
         self.subscriptions
             .retain(|_, subscription| !subscription.sender.is_closed());
@@ -631,9 +612,7 @@ impl ConnectionHandler {
                 queue_group: subscription.queue_group.to_owned(),
             });
         }
-        self.connector.events_tx.try_send(Event::Connected).ok();
-
-        Ok(())
+        let _ = self.connector.events_tx.try_send(Event::Connected);
     }
 }
 
@@ -714,7 +693,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
 
     task::spawn(async move {
         if connection.is_none() && options.retry_on_initial_connect {
-            let (info, connection_ok) = connector.connect().await.unwrap();
+            let (info, connection_ok) = connector.connect().await;
             info_sender.send(info).ok();
             connection = Some(connection_ok);
         }
