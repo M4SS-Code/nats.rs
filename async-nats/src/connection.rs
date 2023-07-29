@@ -59,6 +59,8 @@ pub(crate) struct Connection {
     pub(crate) stream: Box<dyn AsyncReadWrite>,
     read_buffer: BytesMut,
     write_buffer: VecDeque<WriteOrFlush>,
+    write_buffer_len: usize,
+    soft_write_buffer_capacity: usize,
     needs_flush: bool,
     write_waker: Option<Waker>,
 }
@@ -71,11 +73,17 @@ pub(crate) enum WriteOrFlush {
 /// Internal representation of the connection.
 /// Holds connection with NATS Server and communicates with `Client` via channels.
 impl Connection {
-    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>, read_buffer_capacity: u16) -> Self {
+    pub(crate) fn new(
+        stream: Box<dyn AsyncReadWrite>,
+        read_buffer_capacity: usize,
+        soft_write_buffer_capacity: usize,
+    ) -> Self {
         Self {
             stream,
-            read_buffer: BytesMut::with_capacity(read_buffer_capacity.into()),
+            read_buffer: BytesMut::with_capacity(read_buffer_capacity),
             write_buffer: VecDeque::new(),
+            write_buffer_len: 0,
+            soft_write_buffer_capacity,
             needs_flush: false,
             write_waker: None,
         }
@@ -388,24 +396,28 @@ impl Connection {
         }
     }
 
-    pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+        let mut written = 0;
         self.write_waker = Some(cx.waker().clone());
 
         loop {
             let next_write = match self.write_buffer.back_mut() {
                 Some(next_write) => next_write,
-                None => return Poll::Ready(Ok(())),
+                None => return Poll::Ready(Ok(written)),
             };
 
             match next_write {
                 WriteOrFlush::Write(buf) => match Pin::new(&mut self.stream).poll_write(cx, buf) {
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending if written == 0 => return Poll::Pending,
+                    Poll::Pending => return Poll::Ready(Ok(written)),
                     Poll::Ready(Ok(n)) => {
                         if n < buf.len() {
                             buf.advance(n);
                         } else {
                             self.write_buffer.pop_back();
                         }
+                        self.write_buffer_len -= n;
+                        written += n;
 
                         continue;
                     }
@@ -416,6 +428,10 @@ impl Connection {
                 }
             }
         }
+    }
+
+    pub(crate) fn should_send_more_write_ops(&self) -> bool {
+        self.write_buffer_len < self.soft_write_buffer_capacity
     }
 
     /// Writes a client operation to the write buffer.
@@ -515,6 +531,7 @@ impl Connection {
             return;
         }
 
+        self.write_buffer_len += buf.len();
         self.write_buffer.push_back(WriteOrFlush::Write(buf));
     }
 

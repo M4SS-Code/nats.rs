@@ -371,38 +371,45 @@ impl ConnectionHandler {
                             self.handler.pending_pings, MAX_PENDING_PINGS
                         );
 
-                        // TODO: handle_disconnect
+                        // TODO: handle_disconnect and wake `cx`
                     } else {
                         self.handler.connection.enqueue_write_op(&ClientOp::Ping);
                     }
                 }
 
-                match self.receiver.poll_recv(cx) {
-                    Poll::Pending => {}
-                    Poll::Ready(Some(cmd)) => {
-                        self.handler.handle_command(cmd);
-                    }
-                    Poll::Ready(None) => return Poll::Ready(Ok(())),
-                }
-
-                match self.handler.connection.poll_read_op(cx) {
-                    Poll::Pending => {}
-                    Poll::Ready(Ok(Some(server_op))) => {
-                        self.handler.handle_server_op(server_op);
-                    }
-                    Poll::Ready(Ok(None)) => {
-                        // TODO: handle_disconnect
-                    }
-                    Poll::Ready(Err(_err)) => {
-                        // TODO: handle_disconnect
+                loop {
+                    match self.handler.connection.poll_read_op(cx) {
+                        Poll::Pending => break,
+                        Poll::Ready(Ok(Some(server_op))) => {
+                            self.handler.handle_server_op(server_op);
+                        }
+                        Poll::Ready(Ok(None)) => {
+                            // TODO: handle_disconnect and wake `cx`
+                        }
+                        Poll::Ready(Err(_err)) => {
+                            // TODO: handle_disconnect and wake `cx`
+                        }
                     }
                 }
 
-                match self.handler.connection.poll_write(cx) {
-                    Poll::Pending => {}
-                    Poll::Ready(Ok(())) => {}
-                    Poll::Ready(Err(_err)) => {
-                        // TODO: handle_disconnect
+                loop {
+                    if self.handler.connection.should_send_more_write_ops() {
+                        match self.receiver.poll_recv(cx) {
+                            Poll::Pending => {}
+                            Poll::Ready(Some(cmd)) => {
+                                self.handler.handle_command(cmd);
+                            }
+                            Poll::Ready(None) => return Poll::Ready(Ok(())),
+                        }
+                    }
+
+                    match self.handler.connection.poll_write(cx) {
+                        Poll::Pending => break,
+                        Poll::Ready(Ok(0)) => break,
+                        Poll::Ready(Ok(_n)) => {}
+                        Poll::Ready(Err(_err)) => {
+                            // TODO: handle_disconnect and wake `cx`
+                        }
                     }
                 }
 
