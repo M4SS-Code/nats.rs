@@ -2334,7 +2334,6 @@ mod jetstream {
         }
 
         let mut iter = consumer.fetch().max_messages(100).messages().await.unwrap();
-        client.flush().await.unwrap();
 
         // TODO: when rtt() is available, use it here.
         tokio::time::sleep(Duration::from_millis(400)).await;
@@ -2345,7 +2344,6 @@ mod jetstream {
         if let Some(message) = iter.next().await {
             message.unwrap().ack().await.unwrap();
         }
-        client.flush().await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let info = consumer.info().await.unwrap();
@@ -2355,7 +2353,6 @@ mod jetstream {
         if let Some(message) = iter.next().await {
             message.unwrap().double_ack().await.unwrap();
         }
-        client.flush().await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(500)).await;
         let info = consumer.info().await.unwrap();
@@ -2369,7 +2366,6 @@ mod jetstream {
                 .await
                 .unwrap();
         }
-        client.flush().await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let info = consumer.info().await.unwrap();

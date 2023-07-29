@@ -71,7 +71,6 @@ mod client {
         let mut subscriber = client.subscribe("test".into()).await.unwrap();
         while !servers.is_empty() {
             client.publish("test".into(), "data".into()).await.unwrap();
-            client.flush().await.unwrap();
             assert!(subscriber.next().await.is_some());
 
             drop(servers.remove(0));

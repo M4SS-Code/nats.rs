@@ -138,7 +138,6 @@ mod client {
             .await
             .unwrap();
 
-        client.flush().await.unwrap();
         assert!(subscription.next().await.is_some());
     }
 }

@@ -24,7 +24,6 @@ async fn main() -> Result<(), async_nats::Error> {
     for _ in 0..10_000_000 {
         client.publish(subject.clone(), dat.clone()).await?;
     }
-    client.flush().await?;
 
     println!("published in {:?}", now.elapsed());
 
