@@ -374,6 +374,7 @@ impl ConnectionHandler {
                         // TODO: handle_disconnect and wake `cx`
                     } else {
                         self.handler.connection.enqueue_write_op(&ClientOp::Ping);
+                        self.is_flushing = true;
                     }
                 }
 
