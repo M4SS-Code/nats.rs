@@ -1057,7 +1057,6 @@ impl Subscriber {
     ///
     /// let mut subscriber = client.subscribe("test".into()).await?;
     /// subscriber.unsubscribe_after(3).await?;
-    /// client.flush().await?;
     ///
     /// for _ in 0..3 {
     ///     client.publish("test".into(), "data".into()).await?;
