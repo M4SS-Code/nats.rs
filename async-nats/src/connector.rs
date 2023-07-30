@@ -300,7 +300,6 @@ impl Connector {
         let mut connection = Connection::new(
             Box::new(BufWriter::new(tcp_stream)),
             self.options.read_buffer_capacity.into(),
-            // TODO: add configuration for soft_write_buffer_capacity
             self.options.soft_write_buffer_capacity.into(),
         );
 
