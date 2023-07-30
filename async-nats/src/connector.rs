@@ -38,6 +38,7 @@ use rand::thread_rng;
 use std::cmp;
 use std::future;
 use std::io;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,6 +61,7 @@ pub(crate) struct ConnectorOptions {
     pub(crate) ignore_discovered_servers: bool,
     pub(crate) retain_servers_order: bool,
     pub(crate) read_buffer_capacity: u16,
+    pub(crate) soft_write_buffer_capacity: NonZeroU16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
 }
@@ -299,7 +301,7 @@ impl Connector {
             Box::new(BufWriter::new(tcp_stream)),
             self.options.read_buffer_capacity.into(),
             // TODO: add configuration for soft_write_buffer_capacity
-            64 * 1024,
+            self.options.soft_write_buffer_capacity.into(),
         );
 
         let op = connection.read_op().await?;

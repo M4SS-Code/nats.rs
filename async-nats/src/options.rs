@@ -18,6 +18,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::engine::Engine;
 use futures::Future;
 use std::fmt::Formatter;
+use std::num::NonZeroU16;
 use std::{
     fmt,
     path::{Path, PathBuf},
@@ -66,6 +67,7 @@ pub struct ConnectOptions {
     pub(crate) ignore_discovered_servers: bool,
     pub(crate) retain_servers_order: bool,
     pub(crate) read_buffer_capacity: u16,
+    pub(crate) soft_write_buffer_capacity: NonZeroU16,
     pub(crate) reconnect_delay_callback: Box<dyn Fn(usize) -> Duration + Send + Sync + 'static>,
     pub(crate) auth_callback: Option<CallbackArg1<Vec<u8>, Result<Auth, AuthError>>>,
 }
@@ -90,6 +92,10 @@ impl fmt::Debug for ConnectOptions {
             .entry(&"inbox_prefix", &self.inbox_prefix)
             .entry(&"retry_on_initial_connect", &self.retry_on_failed_connect)
             .entry(&"read_buffer_capacity", &self.read_buffer_capacity)
+            .entry(
+                &"soft_write_buffer_capacity",
+                &self.soft_write_buffer_capacity.get(),
+            )
             .finish()
     }
 }
@@ -123,6 +129,7 @@ impl Default for ConnectOptions {
             ignore_discovered_servers: false,
             retain_servers_order: false,
             read_buffer_capacity: 65535,
+            soft_write_buffer_capacity: NonZeroU16::new(65535).unwrap(),
             reconnect_delay_callback: Box::new(|attempts| {
                 connector::reconnect_delay_callback_default(attempts)
             }),
@@ -902,6 +909,35 @@ impl ConnectOptions {
     /// ```
     pub fn read_buffer_capacity(mut self, size: u16) -> ConnectOptions {
         self.read_buffer_capacity = size;
+        self
+    }
+
+    /// Sets the maximum soft capacity of the internal write buffer.
+    ///
+    /// Using too low of a value may reduce write performance.
+    ///
+    /// # Examples
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    /// async_nats::ConnectOptions::new()
+    ///     .soft_write_buffer_capacity(65535)
+    ///     .connect("demo.nats.io")
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The client has an internal queue of chunks of memory it has to
+    /// write to the network. Before doing a write operation more messages
+    /// get polled from the sender channel if the queue hasn't exceeded
+    /// the capacity. The message is serialized and put into the internal
+    /// queue. A single message is allowed to exceed the soft limit, after
+    /// which no more messages will be added until the limit goes under
+    /// the limit again.
+    pub fn soft_write_buffer_capacity(mut self, size: u16) -> ConnectOptions {
+        self.soft_write_buffer_capacity =
+            NonZeroU16::new(size).unwrap_or_else(|| NonZeroU16::new(1).unwrap());
         self
     }
 }

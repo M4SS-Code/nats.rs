@@ -710,6 +710,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
             ignore_discovered_servers: options.ignore_discovered_servers,
             retain_servers_order: options.retain_servers_order,
             read_buffer_capacity: options.read_buffer_capacity,
+            soft_write_buffer_capacity: options.soft_write_buffer_capacity,
             reconnect_delay_callback: options.reconnect_delay_callback,
             auth_callback: options.auth_callback,
         },
