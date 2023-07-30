@@ -78,6 +78,10 @@ impl Connection {
         }
     }
 
+    pub(crate) fn needs_flush(&self) -> bool {
+        self.needs_flush
+    }
+
     /// Attempts to read a server operation from the read buffer.
     /// Returns `None` if there is not enough data to parse an entire operation.
     pub(crate) fn try_read_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
