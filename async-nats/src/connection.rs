@@ -60,15 +60,10 @@ impl Display for State {
 pub(crate) struct Connection {
     pub(crate) stream: Box<dyn AsyncReadWrite>,
     read_buffer: BytesMut,
-    write_buffer: VecDeque<WriteOrFlush>,
+    write_buffer: VecDeque<Bytes>,
     write_buffer_len: usize,
     soft_write_buffer_capacity: NonZeroUsize,
     needs_flush: bool,
-}
-
-pub(crate) enum WriteOrFlush {
-    Write(Bytes),
-    Flush,
 }
 
 /// Internal representation of the connection.
@@ -406,35 +401,33 @@ impl Connection {
     }
 
     pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut wrote = false;
+
         loop {
-            let next_write = match self.write_buffer.front_mut() {
-                Some(next_write) => next_write,
-                None => return Poll::Ready(Ok(())),
+            let buf = match self.write_buffer.front_mut() {
+                Some(buf) => buf,
+                None => {
+                    self.needs_flush |= wrote;
+                    return Poll::Ready(Ok(()));
+                }
             };
 
-            match next_write {
-                WriteOrFlush::Write(buf) => {
-                    debug_assert!(!buf.is_empty());
+            debug_assert!(!buf.is_empty());
+            match Pin::new(&mut self.stream).poll_write(cx, buf) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(n)) => {
+                    wrote = true;
 
-                    match Pin::new(&mut self.stream).poll_write(cx, buf) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(n)) => {
-                            if n < buf.len() {
-                                buf.advance(n);
-                            } else {
-                                self.write_buffer.pop_front();
-                            }
-                            self.write_buffer_len -= n;
-
-                            continue;
-                        }
-                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    if n < buf.len() {
+                        buf.advance(n);
+                    } else {
+                        self.write_buffer.pop_front();
                     }
+                    self.write_buffer_len -= n;
+
+                    continue;
                 }
-                WriteOrFlush::Flush => {
-                    self.needs_flush = true;
-                    self.write_buffer.pop_front();
-                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             }
         }
     }
@@ -468,14 +461,10 @@ impl Connection {
                 respond,
                 headers,
             } => {
-                match headers.as_ref() {
-                    Some(headers) if !headers.is_empty() => {
-                        self.write("HPUB ");
-                    }
-                    _ => {
-                        self.write("PUB ");
-                    }
-                }
+                self.write(match headers.as_ref() {
+                    Some(headers) if !headers.is_empty() => "HPUB ",
+                    _ => "PUB ",
+                });
 
                 // TODO: change subject into `Bytes`
                 self.write(Bytes::copy_from_slice(subject.as_bytes()));
@@ -535,8 +524,6 @@ impl Connection {
                 self.write("PONG\r\n");
             }
         }
-
-        self.write_buffer.push_back(WriteOrFlush::Flush);
     }
 
     fn write(&mut self, buf: impl Into<Bytes>) {
@@ -546,7 +533,7 @@ impl Connection {
         }
 
         self.write_buffer_len += buf.len();
-        self.write_buffer.push_back(WriteOrFlush::Write(buf));
+        self.write_buffer.push_back(buf);
     }
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
