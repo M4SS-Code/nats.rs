@@ -78,6 +78,10 @@ impl Connection {
         }
     }
 
+    pub(crate) fn is_write_buf_full(&self) -> bool {
+        self.write_buf_len >= 65535
+    }
+
     pub(crate) fn needs_flush(&self) -> bool {
         self.needs_flush
     }
