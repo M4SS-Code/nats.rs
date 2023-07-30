@@ -27,6 +27,8 @@ use crate::header::{HeaderMap, HeaderName, IntoHeaderValue};
 use crate::status::StatusCode;
 use crate::{ClientOp, ServerError, ServerOp};
 
+const SOFT_WRITE_BUF_LIMIT: usize = 65535;
+
 /// Supertrait enabling trait object for containing both TLS and non TLS `TcpStream` connection.
 pub(crate) trait AsyncReadWrite: AsyncWrite + AsyncRead + Send + Unpin {}
 
@@ -57,6 +59,7 @@ pub(crate) struct Connection {
     read_buf: BytesMut,
     write_buf: VecDeque<Bytes>,
     write_buf_len: usize,
+    can_flush: bool,
 }
 
 /// Internal representation of the connection.
@@ -68,7 +71,16 @@ impl Connection {
             read_buf: BytesMut::with_capacity(read_buffer_capacity),
             write_buf: VecDeque::new(),
             write_buf_len: 0,
+            can_flush: false,
         }
+    }
+
+    pub(crate) fn is_write_buf_full(&self) -> bool {
+        self.write_buf_len >= SOFT_WRITE_BUF_LIMIT
+    }
+
+    pub(crate) fn should_flush(&self) -> bool {
+        self.can_flush && self.write_buf.is_empty()
     }
 
     /// Attempts to read a server operation from the read buffer.
@@ -476,6 +488,7 @@ impl Connection {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(n)) => {
                     self.write_buf_len -= n;
+                    self.can_flush = true;
 
                     if n < buf.len() {
                         buf.advance(n);
@@ -499,10 +512,17 @@ impl Connection {
         self.write_buf.push_back(buf);
     }
 
-    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.can_flush {
+            return Poll::Ready(Ok(()));
+        }
+
         match Pin::new(&mut self.stream).poll_flush(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(())) => {
+                self.can_flush = false;
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
