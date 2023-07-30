@@ -538,7 +538,6 @@ impl Connection {
 
     pub(crate) fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.needs_flush {
-            warn!("Connection::poll_flush called when flushing wasn't needed");
             return Poll::Ready(Ok(()));
         }
 
