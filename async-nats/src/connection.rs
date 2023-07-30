@@ -13,6 +13,7 @@
 
 //! This module provides a connection implementation for communicating with a NATS server.
 
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::future::{self, Future};
 use std::str::{self, FromStr};
@@ -21,7 +22,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io;
 
 use crate::header::{HeaderMap, HeaderName};
@@ -56,6 +57,13 @@ impl Display for State {
 pub(crate) struct Connection {
     pub(crate) stream: Box<dyn AsyncReadWrite>,
     read_buf: BytesMut,
+    write_buf: VecDeque<WriteOrFlush>,
+    write_buf_len: usize,
+}
+
+enum WriteOrFlush {
+    Write(Bytes),
+    Flush,
 }
 
 /// Internal representation of the connection.
@@ -65,6 +73,8 @@ impl Connection {
         Self {
             stream,
             read_buf: BytesMut::with_capacity(read_buffer_capacity),
+            write_buf: VecDeque::new(),
+            write_buf_len: 0,
         }
     }
 
@@ -474,6 +484,16 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    fn write(&mut self, buf: impl Into<Bytes>) {
+        let buf = buf.into();
+        if buf.is_empty() {
+            return;
+        }
+
+        self.write_buf_len += buf.len();
+        self.write_buf.push_back(WriteOrFlush::Write(buf));
     }
 
     /// Flush the write buffer, sending all pending data down the current write stream.
