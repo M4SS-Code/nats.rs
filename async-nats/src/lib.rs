@@ -385,11 +385,7 @@ impl ConnectionHandler {
                         self.handle_disconnect().await?;
                     }
 
-                    if let Err(_err) = self.connection.write_op(&ClientOp::Ping).await {
-                        self.handle_disconnect().await?;
-                    }
-
-                    self.handle_flush().await?;
+                    self.connection.enqueue_write_op(&ClientOp::Ping);
 
                 },
                 _ = self.flush_interval.tick().fuse() => {
@@ -438,7 +434,7 @@ impl ConnectionHandler {
 
         match server_op {
             ServerOp::Ping => {
-                self.connection.write_op(&ClientOp::Pong).await?;
+                self.connection.enqueue_write_op(&ClientOp::Pong);
                 self.handle_flush().await?;
             }
             ServerOp::Pong => {
@@ -496,9 +492,7 @@ impl ConnectionHandler {
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             self.subscriptions.remove(&sid);
                             self.connection
-                                .write_op(&ClientOp::Unsubscribe { sid, max: None })
-                                .await?;
-                            self.handle_flush().await?;
+                                .enqueue_write_op(&ClientOp::Unsubscribe { sid, max: None });
                         }
                     }
                 } else if sid == MULTIPLEXER_SID {
@@ -517,9 +511,7 @@ impl ConnectionHandler {
                                     length,
                                 };
 
-                                sender.send(message).map_err(|_| {
-                                    io::Error::new(io::ErrorKind::Other, "request receiver closed")
-                                })?;
+                                let _ = sender.send(message);
                             }
                         }
                     }
@@ -544,8 +536,8 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    async fn handle_flush(&mut self) -> Result<(), io::Error> {
-        self.connection.flush().await?;
+    async fn handle_flush(&mut self) -> io::Result<()> {
+        self.connection.easy_write_and_flush([].iter()).await?;
         self.flush_interval.reset();
 
         Ok(())
@@ -569,13 +561,8 @@ impl ConnectionHandler {
                         }
                     }
 
-                    if let Err(err) = self
-                        .connection
-                        .write_op(&ClientOp::Unsubscribe { sid, max })
-                        .await
-                    {
-                        error!("Send failed with {:?}", err);
-                    }
+                    self.connection
+                        .enqueue_write_op(&ClientOp::Unsubscribe { sid, max });
                 }
             }
             Command::Flush { result } => {
@@ -618,17 +605,11 @@ impl ConnectionHandler {
 
                 self.subscriptions.insert(sid, subscription);
 
-                if let Err(err) = self
-                    .connection
-                    .write_op(&ClientOp::Subscribe {
-                        sid,
-                        subject,
-                        queue_group,
-                    })
-                    .await
-                {
-                    error!("Sending Subscribe failed with {:?}", err);
-                }
+                self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                    sid,
+                    subject,
+                    queue_group,
+                });
             }
             Command::Request {
                 subject,
@@ -646,17 +627,11 @@ impl ConnectionHandler {
                 } else {
                     let subject = format!("{}.*", prefix);
 
-                    if let Err(err) = self
-                        .connection
-                        .write_op(&ClientOp::Subscribe {
-                            sid: MULTIPLEXER_SID,
-                            subject: subject.clone(),
-                            queue_group: None,
-                        })
-                        .await
-                    {
-                        error!("Sending Subscribe failed with {:?}", err);
-                    }
+                    self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                        sid: MULTIPLEXER_SID,
+                        subject: subject.clone(),
+                        queue_group: None,
+                    });
 
                     self.multiplexer.insert(Multiplexer {
                         subject,
@@ -674,12 +649,7 @@ impl ConnectionHandler {
                     headers,
                 };
 
-                while let Err(err) = self.connection.write_op(&pub_op).await {
-                    self.handle_disconnect().await?;
-                    error!("Sending Publish failed with {:?}", err);
-                }
-
-                self.connection.flush().await?;
+                self.connection.enqueue_write_op(&pub_op);
             }
 
             Command::Publish {
@@ -688,16 +658,12 @@ impl ConnectionHandler {
                 respond,
                 headers,
             } => {
-                let pub_op = ClientOp::Publish {
+                self.connection.enqueue_write_op(&ClientOp::Publish {
                     subject,
                     payload,
                     respond,
                     headers,
-                };
-                while let Err(err) = self.connection.write_op(&pub_op).await {
-                    self.handle_disconnect().await?;
-                    error!("Sending Publish failed with {:?}", err);
-                }
+                });
             }
         }
 
@@ -727,25 +693,19 @@ impl ConnectionHandler {
             .retain(|_, subscription| !subscription.sender.is_closed());
 
         for (sid, subscription) in &self.subscriptions {
-            self.connection
-                .write_op(&ClientOp::Subscribe {
-                    sid: *sid,
-                    subject: subscription.subject.to_owned(),
-                    queue_group: subscription.queue_group.to_owned(),
-                })
-                .await
-                .unwrap();
+            self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                sid: *sid,
+                subject: subscription.subject.to_owned(),
+                queue_group: subscription.queue_group.to_owned(),
+            });
         }
 
         if let Some(multiplexer) = &self.multiplexer {
-            self.connection
-                .write_op(&ClientOp::Subscribe {
-                    sid: MULTIPLEXER_SID,
-                    subject: multiplexer.subject.to_owned(),
-                    queue_group: None,
-                })
-                .await
-                .unwrap();
+            self.connection.enqueue_write_op(&ClientOp::Subscribe {
+                sid: MULTIPLEXER_SID,
+                subject: multiplexer.subject.to_owned(),
+                queue_group: None,
+            });
         }
 
         self.connector.events_tx.try_send(Event::Connected).ok();
