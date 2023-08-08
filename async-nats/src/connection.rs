@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Write as _};
 use std::future::{self, Future};
+use std::io::IoSlice;
 use std::pin::Pin;
 use std::str::{self, FromStr};
 use std::task::{Context, Poll};
@@ -483,6 +484,14 @@ impl Connection {
     }
 
     pub(crate) fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.stream.is_write_vectored() {
+            self.poll_write_sequential(cx)
+        } else {
+            self.poll_write_vectored(cx)
+        }
+    }
+
+    fn poll_write_sequential(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         loop {
             let buf = match self.write_buf.front_mut() {
                 Some(buf) => &**buf,
@@ -510,6 +519,56 @@ impl Connection {
                         }
                     }
                     continue;
+                }
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            }
+        }
+    }
+
+    fn poll_write_vectored(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let mut writes = [IoSlice::new(b""); 64];
+            let mut writes_len = 0;
+
+            self.write_buf
+                .iter()
+                .take(64)
+                .enumerate()
+                .for_each(|(i, buf)| {
+                    writes[i] = IoSlice::new(buf);
+                    writes_len += 1;
+                });
+
+            if writes_len < 64 && !self.flattened_writes.is_empty() {
+                writes[writes_len] = IoSlice::new(&self.flattened_writes);
+                writes_len += 1;
+            }
+
+            if writes_len == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            match Pin::new(&mut self.stream).poll_write_vectored(cx, &writes[..writes_len]) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(mut n)) => {
+                    self.write_buf_len -= n;
+                    self.can_flush = true;
+
+                    while let Some(buf) = self.write_buf.front_mut() {
+                        if n == 0 {
+                            break;
+                        }
+
+                        if buf.len() <= n {
+                            n -= buf.len();
+                            self.write_buf.pop_front();
+                        } else {
+                            buf.advance(n);
+                            n = 0;
+                        }
+                    }
+
+                    self.flattened_writes.advance(n);
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             }
