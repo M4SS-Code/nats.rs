@@ -137,7 +137,7 @@ pub mod kv;
 pub mod message;
 pub mod object_store;
 pub mod publish;
-pub mod response;
+mod response;
 pub mod stream;
 
 pub use context::Context;

@@ -18,7 +18,7 @@ use serde::Deserialize;
 /// A response returned from a request to jetstream.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub enum Response<T> {
+pub(super) enum Response<T> {
     Err { error: super::errors::Error },
     Ok(T),
 }
