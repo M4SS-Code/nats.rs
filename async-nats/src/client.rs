@@ -346,9 +346,6 @@ impl Client {
                 }
                 None => self.publish_with_reply(subject, inbox, payload).await?,
             }
-            self.flush()
-                .await
-                .map_err(|err| RequestError::with_source(RequestErrorKind::Other, err))?;
             let request = match timeout {
                 Some(timeout) => {
                     tokio::time::timeout(timeout, sub.next())
@@ -517,12 +514,11 @@ impl Client {
     pub async fn flush(&self) -> Result<(), FlushError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(Command::Flush { result: tx })
+            .send(Command::Flush { observer: tx })
             .await
             .map_err(|err| FlushError::with_source(FlushErrorKind::SendError, err))?;
-        // first question mark is an error from rx itself, second for error from flush.
+
         rx.await
-            .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?
             .map_err(|err| FlushError::with_source(FlushErrorKind::FlushError, err))?;
         Ok(())
     }
