@@ -35,7 +35,7 @@ use crate::{header, Message};
 use self::bucket::Status;
 
 use super::{
-    consumer::{push::OrderedError, DeliverPolicy, StreamError, StreamErrorKind},
+    consumer::{pull::OrderedError, DeliverPolicy, StreamError, StreamErrorKind},
     context::{PublishError, PublishErrorKind},
     stream::{
         ConsumerError, ConsumerErrorKind, DirectGetError, DirectGetErrorKind, RawMessage,
@@ -469,8 +469,7 @@ impl Store {
         debug!("initial consumer creation");
         let consumer = self
             .stream
-            .create_consumer(super::consumer::push::OrderedConfig {
-                deliver_subject: self.stream.context.client.new_inbox(),
+            .create_consumer(super::consumer::pull::OrderedConfig {
                 description: Some("kv watch consumer".to_string()),
                 filter_subject: subject,
                 replay_policy: super::consumer::ReplayPolicy::Instant,
@@ -755,8 +754,7 @@ impl Store {
 
         let consumer = self
             .stream
-            .create_consumer(super::consumer::push::OrderedConfig {
-                deliver_subject: self.stream.context.client.new_inbox(),
+            .create_consumer(super::consumer::pull::OrderedConfig {
                 description: Some("kv history consumer".to_string()),
                 filter_subject: subject,
                 replay_policy: super::consumer::ReplayPolicy::Instant,
@@ -824,8 +822,7 @@ impl Store {
 
         let consumer = self
             .stream
-            .create_consumer(super::consumer::push::OrderedConfig {
-                deliver_subject: self.stream.context.client.new_inbox(),
+            .create_consumer(super::consumer::pull::OrderedConfig {
                 description: Some("kv history consumer".to_string()),
                 filter_subject: subject,
                 headers_only: true,
@@ -849,7 +846,7 @@ impl Store {
 
 /// A structure representing a watch on a key-value bucket, yielding values whenever there are changes.
 pub struct Watch<'a> {
-    subscription: super::consumer::push::Ordered<'a>,
+    subscription: super::consumer::pull::Ordered<'a>,
     prefix: String,
     bucket: String,
 }
@@ -903,7 +900,7 @@ impl<'a> futures::Stream for Watch<'a> {
 
 /// A structure representing the history of a key-value bucket, yielding past values.
 pub struct History<'a> {
-    subscription: super::consumer::push::Ordered<'a>,
+    subscription: super::consumer::pull::Ordered<'a>,
     done: bool,
     prefix: String,
     bucket: String,
