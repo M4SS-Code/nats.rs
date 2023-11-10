@@ -39,6 +39,7 @@ tokio-retry = "0.3"
 ring = "0.17"
 rand = "0.8"
 webpki = { package = "rustls-webpki", version = "0.101.2", features = ["alloc", "std"] }
+flume = { version = "0.11", default-features = false, features = ["async"] }
 
 # for -Z minimal-versions
 rustls = "0.21.6" # used by tokio-rustls 0.24.0

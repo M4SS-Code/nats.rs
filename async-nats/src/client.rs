@@ -39,8 +39,8 @@ static VERSION_RE: Lazy<Regex> =
 #[error("failed to publish message: {0}")]
 pub struct PublishError(#[source] crate::Error);
 
-impl From<tokio::sync::mpsc::error::SendError<Command>> for PublishError {
-    fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
+impl From<flume::SendError<Command>> for PublishError {
+    fn from(err: flume::SendError<Command>) -> Self {
         PublishError(Box::new(err))
     }
 }
@@ -52,7 +52,7 @@ impl From<tokio::sync::mpsc::error::SendError<Command>> for PublishError {
 pub struct Client {
     info: tokio::sync::watch::Receiver<ServerInfo>,
     pub(crate) state: tokio::sync::watch::Receiver<State>,
-    pub(crate) sender: mpsc::Sender<Command>,
+    pub(crate) sender: flume::Sender<Command>,
     next_subscription_id: Arc<AtomicU64>,
     subscription_capacity: usize,
     inbox_prefix: String,
@@ -63,7 +63,7 @@ impl Client {
     pub(crate) fn new(
         info: tokio::sync::watch::Receiver<ServerInfo>,
         state: tokio::sync::watch::Receiver<State>,
-        sender: mpsc::Sender<Command>,
+        sender: flume::Sender<Command>,
         capacity: usize,
         inbox_prefix: String,
         request_timeout: Option<Duration>,
@@ -156,7 +156,7 @@ impl Client {
         let subject = subject.to_subject();
 
         self.sender
-            .send(Command::Publish {
+            .send_async(Command::Publish {
                 subject,
                 payload,
                 respond: None,
@@ -194,7 +194,7 @@ impl Client {
         let subject = subject.to_subject();
 
         self.sender
-            .send(Command::Publish {
+            .send_async(Command::Publish {
                 subject,
                 payload,
                 respond: None,
@@ -230,7 +230,7 @@ impl Client {
         let reply = reply.to_subject();
 
         self.sender
-            .send(Command::Publish {
+            .send_async(Command::Publish {
                 subject,
                 payload,
                 respond: Some(reply),
@@ -269,7 +269,7 @@ impl Client {
         let reply = reply.to_subject();
 
         self.sender
-            .send(Command::Publish {
+            .send_async(Command::Publish {
                 subject,
                 payload,
                 respond: Some(reply),
@@ -395,7 +395,7 @@ impl Client {
             let headers = request.headers;
 
             self.sender
-                .send(Command::Request {
+                .send_async(Command::Request {
                     subject,
                     payload,
                     respond,
@@ -469,7 +469,7 @@ impl Client {
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
 
         self.sender
-            .send(Command::Subscribe {
+            .send_async(Command::Subscribe {
                 sid,
                 subject,
                 queue_group: None,
@@ -507,7 +507,7 @@ impl Client {
         let (sender, receiver) = mpsc::channel(self.subscription_capacity);
 
         self.sender
-            .send(Command::Subscribe {
+            .send_async(Command::Subscribe {
                 sid,
                 subject,
                 queue_group: Some(queue_group),
@@ -533,7 +533,7 @@ impl Client {
     pub async fn flush(&self) -> Result<(), FlushError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(Command::Flush { observer: tx })
+            .send_async(Command::Flush { observer: tx })
             .await
             .map_err(|err| FlushError::with_source(FlushErrorKind::SendError, err))?;
 
@@ -660,8 +660,8 @@ impl Request {
 #[error("failed to send subscribe: {0}")]
 pub struct SubscribeError(#[source] crate::Error);
 
-impl From<tokio::sync::mpsc::error::SendError<Command>> for SubscribeError {
-    fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
+impl From<flume::SendError<Command>> for SubscribeError {
+    fn from(err: flume::SendError<Command>) -> Self {
         SubscribeError(Box::new(err))
     }
 }

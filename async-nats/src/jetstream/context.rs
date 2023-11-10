@@ -195,7 +195,7 @@ impl Context {
         let send_fut = self
             .client
             .sender
-            .send(Command::Request {
+            .send_async(Command::Request {
                 subject,
                 payload: publish.payload,
                 respond,

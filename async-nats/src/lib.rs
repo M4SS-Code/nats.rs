@@ -439,10 +439,10 @@ impl ConnectionHandler {
         }
     }
 
-    pub(crate) async fn process<'a>(&'a mut self, receiver: &'a mut mpsc::Receiver<Command>) {
+    pub(crate) async fn process<'a>(&'a mut self, receiver: &'a mut flume::Receiver<Command>) {
         struct ProcessFut<'a> {
             handler: &'a mut ConnectionHandler,
-            receiver: &'a mut mpsc::Receiver<Command>,
+            receiver: flume::r#async::RecvStream<'a, Command>,
         }
 
         enum ExitReason {
@@ -516,7 +516,7 @@ impl ConnectionHandler {
                 let mut made_progress = true;
                 loop {
                     while !self.handler.connection.is_write_buf_full() {
-                        match self.receiver.poll_recv(cx) {
+                        match Pin::new(&mut self.receiver).poll_next(cx) {
                             Poll::Pending => break,
                             Poll::Ready(Some(cmd)) => {
                                 made_progress = true;
@@ -578,7 +578,7 @@ impl ConnectionHandler {
         loop {
             let process = ProcessFut {
                 handler: self,
-                receiver,
+                receiver: receiver.stream(),
             };
             match process.await {
                 ExitReason::Disconnected(err) => {
@@ -890,7 +890,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     }
 
     let (info_sender, info_watcher) = tokio::sync::watch::channel(info);
-    let (sender, mut receiver) = mpsc::channel(options.sender_capacity);
+    let (sender, mut receiver) = flume::bounded(options.sender_capacity);
 
     let client = Client::new(
         info_watcher,
@@ -1074,13 +1074,13 @@ impl From<io::Error> for ConnectError {
 pub struct Subscriber {
     sid: u64,
     receiver: mpsc::Receiver<Message>,
-    sender: mpsc::Sender<Command>,
+    sender: flume::Sender<Command>,
 }
 
 impl Subscriber {
     fn new(
         sid: u64,
-        sender: mpsc::Sender<Command>,
+        sender: flume::Sender<Command>,
         receiver: mpsc::Receiver<Message>,
     ) -> Subscriber {
         Subscriber {
@@ -1106,7 +1106,7 @@ impl Subscriber {
     /// ```
     pub async fn unsubscribe(&mut self) -> Result<(), UnsubscribeError> {
         self.sender
-            .send(Command::Unsubscribe {
+            .send_async(Command::Unsubscribe {
                 sid: self.sid,
                 max: None,
             })
@@ -1142,7 +1142,7 @@ impl Subscriber {
     /// ```
     pub async fn unsubscribe_after(&mut self, unsub_after: u64) -> Result<(), UnsubscribeError> {
         self.sender
-            .send(Command::Unsubscribe {
+            .send_async(Command::Unsubscribe {
                 sid: self.sid,
                 max: Some(unsub_after),
             })
@@ -1155,8 +1155,8 @@ impl Subscriber {
 #[error("failed to send unsubscribe")]
 pub struct UnsubscribeError(String);
 
-impl From<tokio::sync::mpsc::error::SendError<Command>> for UnsubscribeError {
-    fn from(err: tokio::sync::mpsc::error::SendError<Command>) -> Self {
+impl From<flume::SendError<Command>> for UnsubscribeError {
+    fn from(err: flume::SendError<Command>) -> Self {
         UnsubscribeError(err.to_string())
     }
 }
@@ -1169,7 +1169,7 @@ impl Drop for Subscriber {
             let sid = self.sid;
             async move {
                 sender
-                    .send(Command::Unsubscribe { sid, max: None })
+                    .send_async(Command::Unsubscribe { sid, max: None })
                     .await
                     .ok();
             }
