@@ -22,7 +22,6 @@ mod object_store {
     use base64::Engine;
     use futures::StreamExt;
     use rand::RngCore;
-    use ring::digest::SHA256;
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
@@ -44,7 +43,7 @@ mod object_store {
         let mut bytes = vec![0; 1024 * 1024 + 22];
         rng.try_fill_bytes(&mut bytes).unwrap();
 
-        let digest = ring::digest::digest(&SHA256, &bytes);
+        let digest = Sha256::digest(&bytes);
 
         bucket.put("FOO", &mut bytes.as_slice()).await.unwrap();
 

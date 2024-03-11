@@ -25,7 +25,6 @@ mod compatibility {
         },
         service::{self, ServiceExt},
     };
-    use ring::digest::{self, SHA256};
     use serde::{Deserialize, Serialize};
     use tokio::io::AsyncReadExt;
 
