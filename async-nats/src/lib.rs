@@ -423,7 +423,6 @@ pub(crate) struct ConnectionHandler {
     pending_pings: usize,
     info_sender: tokio::sync::watch::Sender<ServerInfo>,
     ping_interval: Interval,
-    is_flushing: bool,
     should_reconnect: bool,
     flush_observers: Vec<oneshot::Sender<()>>,
 }
@@ -446,7 +445,6 @@ impl ConnectionHandler {
             pending_pings: 0,
             info_sender,
             ping_interval,
-            is_flushing: false,
             should_reconnect: false,
             flush_observers: Vec::new(),
         }
@@ -588,12 +586,13 @@ impl ConnectionHandler {
                     }
                 }
 
-                if self.handler.is_flushing || self.handler.connection.should_flush() {
+                if let (ShouldFlush::Yes, _) | (ShouldFlush::No, false) = (
+                    self.handler.connection.should_flush(),
+                    self.handler.flush_observers.is_empty(),
+                ) {
                     match self.handler.connection.poll_flush(cx) {
                         Poll::Pending => {}
                         Poll::Ready(Ok(())) => {
-                            self.handler.is_flushing = false;
-
                             for observer in self.handler.flush_observers.drain(..) {
                                 let _ = observer.send(());
                             }
@@ -763,7 +762,6 @@ impl ConnectionHandler {
                 }
             }
             Command::Flush { observer } => {
-                self.is_flushing = true;
                 self.flush_observers.push(observer);
             }
             Command::Subscribe {
@@ -1581,6 +1579,8 @@ macro_rules! from_with_timeout {
     };
 }
 pub(crate) use from_with_timeout;
+
+use crate::connection::ShouldFlush;
 
 #[cfg(test)]
 mod tests {
