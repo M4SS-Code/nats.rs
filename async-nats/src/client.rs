@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tracing::trace;
 
 static VERSION_RE: Lazy<Regex> =
@@ -72,18 +73,46 @@ pub struct Client {
     inbox_prefix: Arc<str>,
     request_timeout: Option<Duration>,
     max_payload: Arc<AtomicUsize>,
+    inner: Arc<std::sync::Mutex<Option<Inner>>>,
 }
 
-impl Client {
-    pub(crate) fn new(
-        info: tokio::sync::watch::Receiver<ServerInfo>,
-        state: tokio::sync::watch::Receiver<State>,
-        sender: mpsc::Sender<Command>,
-        capacity: usize,
-        inbox_prefix: String,
-        request_timeout: Option<Duration>,
-        max_payload: Arc<AtomicUsize>,
-    ) -> Client {
+#[derive(Debug)]
+struct Inner {
+    events_handler_task: JoinHandle<()>,
+    connection_handler_task: JoinHandle<()>,
+}
+
+pub(super) struct Builder {
+    pub(super) info: tokio::sync::watch::Receiver<ServerInfo>,
+    pub(super) state: tokio::sync::watch::Receiver<State>,
+    pub(super) sender: mpsc::Sender<Command>,
+    pub(super) capacity: usize,
+    pub(super) inbox_prefix: String,
+    pub(super) request_timeout: Option<Duration>,
+    pub(super) max_payload: Arc<AtomicUsize>,
+    pub(super) events_handler_task: JoinHandle<()>,
+    pub(super) connection_handler_task: JoinHandle<()>,
+}
+
+impl Builder {
+    pub(super) fn build(self) -> Client {
+        let Self {
+            info,
+            state,
+            sender,
+            capacity,
+            inbox_prefix,
+            request_timeout,
+            max_payload,
+            events_handler_task,
+            connection_handler_task,
+        } = self;
+
+        let inner = Arc::new(std::sync::Mutex::new(Some(Inner {
+            events_handler_task,
+            connection_handler_task,
+        })));
+
         Client {
             info,
             state,
@@ -93,9 +122,12 @@ impl Client {
             inbox_prefix: inbox_prefix.into(),
             request_timeout,
             max_payload,
+            inner,
         }
     }
+}
 
+impl Client {
     /// Returns last received info from the server.
     ///
     /// # Examples
@@ -606,6 +638,29 @@ impl Client {
             .send(Command::Reconnect)
             .await
             .map_err(Into::into)
+    }
+
+    /// Stops the NATS client
+    ///
+    /// # Panics
+    ///
+    /// Panics if the client has been already closed or if one of the tasks involved in events and
+    /// connection handling panic.
+    pub async fn stop(self) {
+        self.sender
+            .send(Command::Close)
+            .await
+            .expect("client already closed");
+
+        let inner = self
+            .inner
+            .lock()
+            .unwrap()
+            .take()
+            .expect("client already closed");
+
+        inner.connection_handler_task.await.unwrap();
+        inner.events_handler_task.await.unwrap();
     }
 }
 
