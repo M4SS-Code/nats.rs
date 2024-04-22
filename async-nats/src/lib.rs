@@ -366,6 +366,13 @@ pub(crate) enum Command {
         observer: oneshot::Sender<()>,
     },
     Reconnect,
+    Close,
+}
+
+#[derive(Debug)]
+enum ShouldClose {
+    Yes,
+    No,
 }
 
 /// `ClientOp` represents all actions of `Client`.
@@ -542,7 +549,9 @@ impl ConnectionHandler {
                                 made_progress = true;
 
                                 for cmd in recv_buf.drain(..) {
-                                    handler.handle_command(cmd);
+                                    if matches!(handler.handle_command(cmd), ShouldClose::Yes) {
+                                        return Poll::Ready(ExitReason::Closed);
+                                    }
                                 }
                             }
                             // TODO: replace `_` with `0` after bumping MSRV to 1.75
@@ -731,7 +740,7 @@ impl ConnectionHandler {
         }
     }
 
-    fn handle_command(&mut self, command: Command) {
+    fn handle_command(&mut self, command: Command) -> ShouldClose {
         self.ping_interval.reset();
 
         match command {
@@ -836,7 +845,10 @@ impl ConnectionHandler {
             Command::Reconnect => {
                 self.should_reconnect = true;
             }
+
+            Command::Close => return ShouldClose::Yes,
         }
+        ShouldClose::No
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), ConnectError> {
@@ -938,17 +950,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     let (info_sender, info_watcher) = tokio::sync::watch::channel(info.clone());
     let (sender, mut receiver) = mpsc::channel(options.sender_capacity);
 
-    let client = Client::new(
-        info_watcher,
-        state_rx,
-        sender,
-        options.subscription_capacity,
-        options.inbox_prefix,
-        options.request_timeout,
-        max_payload,
-    );
-
-    task::spawn(async move {
+    let events_handler_task = task::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             tracing::info!("event: {}", event);
             if let Some(event_callback) = &options.event_callback {
@@ -957,7 +959,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         }
     });
 
-    task::spawn(async move {
+    let connection_handler_task = task::spawn(async move {
         if connection.is_none() && options.retry_on_initial_connect {
             let (info, connection_ok) = match connector.connect().await {
                 Ok((info, connection)) => (info, connection),
@@ -975,7 +977,18 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         connection_handler.process(&mut receiver).await
     });
 
-    Ok(client)
+    Ok(client::Builder {
+        info: info_watcher,
+        state: state_rx,
+        sender,
+        capacity: options.subscription_capacity,
+        inbox_prefix: options.inbox_prefix,
+        request_timeout: options.request_timeout,
+        max_payload,
+        events_handler_task,
+        connection_handler_task,
+    }
+    .build())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
