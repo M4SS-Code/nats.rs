@@ -14,18 +14,22 @@
 //! This module provides a connection implementation for communicating with a NATS server.
 
 use std::collections::VecDeque;
+use std::error::Error as StdError;
 use std::fmt::{self, Display, Write as _};
 use std::future::{self, Future};
 use std::io::IoSlice;
+use std::num::ParseIntError;
+use std::ops::Not;
 use std::pin::Pin;
-use std::str::{self, FromStr};
+use std::str::{self, FromStr, Utf8Error};
+use std::string::FromUtf8Error;
 use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 
-use crate::header::{HeaderMap, HeaderName, IntoHeaderValue};
-use crate::status::StatusCode;
+use crate::header::{self, HeaderMap, HeaderName, IntoHeaderValue};
+use crate::status::{self, StatusCode};
 use crate::subject::Subject;
 use crate::{ClientOp, ServerError, ServerOp};
 
@@ -115,7 +119,9 @@ impl Connection {
 
     /// Attempts to read a server operation from the read buffer.
     /// Returns `None` if there is not enough data to parse an entire operation.
-    pub(crate) fn try_read_op(&mut self) -> Result<Option<ServerOp>, io::Error> {
+    pub(crate) fn try_read_op(&mut self) -> Result<Option<ServerOp>, ReadOpError> {
+        use ReadOpError as E;
+
         let len = match memchr::memmem::find(&self.read_buf, b"\r\n") {
             Some(len) => len,
             None => return Ok(None),
@@ -137,19 +143,31 @@ impl Connection {
         }
 
         if self.read_buf.starts_with(b"-ERR") {
-            let description = str::from_utf8(&self.read_buf[5..len])
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?
+            let description = &self.read_buf[5..len];
+            let description = str::from_utf8(description)
+                .map_err(|source| E::InvalidError {
+                    source,
+                    raw_message: description.to_owned(),
+                })?
                 .trim_matches('\'')
                 .to_owned();
 
             self.read_buf.advance(len + 2);
 
-            return Ok(Some(ServerOp::Error(ServerError::new(description))));
+            let error = if description.eq_ignore_ascii_case("authorization violation") {
+                ServerError::AuthorizationViolation
+            } else {
+                ServerError::Other(description)
+            };
+            return Ok(Some(ServerOp::Error(error)));
         }
 
         if self.read_buf.starts_with(b"INFO ") {
-            let info = serde_json::from_slice(&self.read_buf[4..len])
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            let info = &self.read_buf[4..len];
+            let info = serde_json::from_slice(info).map_err(|source| E::Info {
+                raw_message: info.to_owned(),
+                source,
+            })?;
 
             self.read_buf.advance(len + 2);
 
@@ -157,235 +175,224 @@ impl Connection {
         }
 
         if self.read_buf.starts_with(b"MSG ") {
-            let line = str::from_utf8(&self.read_buf[4..len]).unwrap();
-            let mut args = line.split(' ').filter(|s| !s.is_empty());
-
-            // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
-            let (subject, sid, reply_to, payload_len) = match (
-                args.next(),
-                args.next(),
-                args.next(),
-                args.next(),
-                args.next(),
-            ) {
-                (Some(subject), Some(sid), Some(reply_to), Some(payload_len), None) => {
-                    (subject, sid, Some(reply_to), payload_len)
-                }
-                (Some(subject), Some(sid), Some(payload_len), None, None) => {
-                    (subject, sid, None, payload_len)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid number of arguments after MSG",
-                    ))
-                }
-            };
-
-            let sid = sid
-                .parse::<u64>()
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-
-            // Parse the number of payload bytes.
-            let payload_len = payload_len
-                .parse::<usize>()
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-
-            // Return early without advancing if there is not enough data read the entire
-            // message
-            if len + payload_len + 4 > self.read_buf.remaining() {
-                return Ok(None);
-            }
-
-            let length = payload_len
-                + reply_to.as_ref().map(|reply| reply.len()).unwrap_or(0)
-                + subject.len();
-
-            let subject = Subject::from(subject);
-            let reply = reply_to.map(Subject::from);
-
-            self.read_buf.advance(len + 2);
-            let payload = self.read_buf.split_to(payload_len).freeze();
-            self.read_buf.advance(2);
-
-            return Ok(Some(ServerOp::Message {
-                sid,
-                length,
-                reply,
-                headers: None,
-                subject,
-                payload,
-                status: None,
-                description: None,
-            }));
+            return self.parse_msg_op(len).map_err(E::Msg);
         }
 
         if self.read_buf.starts_with(b"HMSG ") {
-            // Extract whitespace-delimited arguments that come after "HMSG".
-            let line = std::str::from_utf8(&self.read_buf[5..len]).unwrap();
-            let mut args = line.split_whitespace().filter(|s| !s.is_empty());
-
-            // <subject> <sid> [reply-to] <# header bytes><# total bytes>
-            let (subject, sid, reply_to, header_len, total_len) = match (
-                args.next(),
-                args.next(),
-                args.next(),
-                args.next(),
-                args.next(),
-                args.next(),
-            ) {
-                (
-                    Some(subject),
-                    Some(sid),
-                    Some(reply_to),
-                    Some(header_len),
-                    Some(total_len),
-                    None,
-                ) => (subject, sid, Some(reply_to), header_len, total_len),
-                (Some(subject), Some(sid), Some(header_len), Some(total_len), None, None) => {
-                    (subject, sid, None, header_len, total_len)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid number of arguments after HMSG",
-                    ))
-                }
-            };
-
-            // Convert the slice into a subject
-            let subject = Subject::from(subject);
-
-            // Parse the subject ID.
-            let sid = sid.parse::<u64>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse sid argument after HMSG",
-                )
-            })?;
-
-            // Convert the slice into a subject.
-            let reply = reply_to.map(Subject::from);
-
-            // Parse the number of payload bytes.
-            let header_len = header_len.parse::<usize>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse the number of header bytes argument after \
-                     HMSG",
-                )
-            })?;
-
-            // Parse the number of payload bytes.
-            let total_len = total_len.parse::<usize>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot parse the number of bytes argument after HMSG",
-                )
-            })?;
-
-            if total_len < header_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "number of header bytes was greater than or equal to the \
-                 total number of bytes after HMSG",
-                ));
-            }
-
-            if len + total_len + 4 > self.read_buf.remaining() {
-                return Ok(None);
-            }
-
-            self.read_buf.advance(len + 2);
-            let header = self.read_buf.split_to(header_len);
-            let payload = self.read_buf.split_to(total_len - header_len).freeze();
-            self.read_buf.advance(2);
-
-            let mut lines = std::str::from_utf8(&header)
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8")
-                })?
-                .lines()
-                .peekable();
-            let version_line = lines.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
-            })?;
-
-            let version_line_suffix = version_line
-                .strip_prefix("NATS/1.0")
-                .map(str::trim)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "header version line does not begin with `NATS/1.0`",
-                    )
-                })?;
-
-            let (status, description) = version_line_suffix
-                .split_once(' ')
-                .map(|(status, description)| (status.trim(), description.trim()))
-                .unwrap_or((version_line_suffix, ""));
-            let status = if !status.is_empty() {
-                Some(status.parse::<StatusCode>().map_err(|_| {
-                    std::io::Error::new(io::ErrorKind::Other, "could not parse status parameter")
-                })?)
-            } else {
-                None
-            };
-            let description = if !description.is_empty() {
-                Some(description.to_owned())
-            } else {
-                None
-            };
-
-            let mut headers = HeaderMap::new();
-            while let Some(line) = lines.next() {
-                if line.is_empty() {
-                    continue;
-                }
-
-                let (name, value) = line.split_once(':').ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
-                })?;
-
-                let name = HeaderName::from_str(name)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-
-                // Read the header value, which might have been split into multiple lines
-                // `trim_start` and `trim_end` do the same job as doing `value.trim().to_owned()` at the end, but without a reallocation
-                let mut value = value.trim_start().to_owned();
-                while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
-                    value.push_str(v);
-                }
-                value.truncate(value.trim_end().len());
-
-                headers.append(name, value.into_header_value());
-            }
-
-            return Ok(Some(ServerOp::Message {
-                length: reply.as_ref().map_or(0, |reply| reply.len()) + subject.len() + total_len,
-                sid,
-                reply,
-                subject,
-                headers: Some(headers),
-                payload,
-                status,
-                description,
-            }));
+            return self.parse_hmsg_op(len).map_err(E::HMsg);
         }
 
-        let buffer = self.read_buf.split_to(len + 2);
-        let line = str::from_utf8(&buffer).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "unable to parse unknown input")
-        })?;
+        let buffer = self.read_buf.split_to(len + 2).to_vec();
+        let line = String::from_utf8(buffer).map_err(E::InvalidInput)?;
 
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid server operation: '{line}'"),
-        ))
+        Err(E::InvalidUtf8Input(line))
     }
 
-    pub(crate) fn read_op(&mut self) -> impl Future<Output = io::Result<Option<ServerOp>>> + '_ {
+    fn parse_msg_op(&mut self, line_len: usize) -> Result<Option<ServerOp>, ParseMsgOpError> {
+        use ParseMsgOpError as E;
+
+        let line = str::from_utf8(&self.read_buf[4..line_len]).map_err(E::InvalidInput)?;
+        let mut args = line.split(' ').filter(|s| !s.is_empty());
+
+        // Parse the operation syntax: MSG <subject> <sid> [reply-to] <#bytes>
+        let (subject, sid, reply_to, payload_len) = match (
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+        ) {
+            (Some(subject), Some(sid), Some(reply_to), Some(payload_len), None) => {
+                (subject, sid, Some(reply_to), payload_len)
+            }
+            (Some(subject), Some(sid), Some(payload_len), None, None) => {
+                (subject, sid, None, payload_len)
+            }
+            _ => {
+                return Err(E::ArgumentsCount);
+            }
+        };
+
+        let sid = sid.parse::<u64>().map_err(|source| E::Sid {
+            source,
+            data: sid.to_owned(),
+        })?;
+
+        // Parse the number of payload bytes.
+        let payload_len = payload_len
+            .parse::<usize>()
+            .map_err(|source| E::PayloadLen {
+                source,
+                data: payload_len.to_owned(),
+            })?;
+
+        // Return early without advancing if there is not enough data read the entire
+        // message
+        if line_len + payload_len + 4 > self.read_buf.remaining() {
+            return Ok(None);
+        }
+
+        let length = payload_len + reply_to.as_ref().map_or(0, |reply| reply.len()) + subject.len();
+
+        let subject = Subject::from(subject);
+        let reply = reply_to.map(Subject::from);
+
+        self.read_buf.advance(line_len + 2);
+        let payload = self.read_buf.split_to(payload_len).freeze();
+        self.read_buf.advance(2);
+
+        Ok(Some(ServerOp::Message {
+            sid,
+            length,
+            reply,
+            headers: None,
+            subject,
+            payload,
+            status: None,
+            description: None,
+        }))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_hmsg_op(&mut self, line_len: usize) -> Result<Option<ServerOp>, ParseHMsgOpError> {
+        use ParseHMsgOpError as E;
+
+        // Extract whitespace-delimited arguments that come after "HMSG".
+        let line = std::str::from_utf8(&self.read_buf[5..line_len]).map_err(E::InvalidInput)?;
+        let mut args = line.split_whitespace().filter(|s| !s.is_empty());
+
+        // <subject> <sid> [reply-to] <# header bytes><# total bytes>
+        let (subject, sid, reply_to, header_len, total_len) = match (
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+            args.next(),
+        ) {
+            (Some(subject), Some(sid), Some(reply_to), Some(header_len), Some(total_len), None) => {
+                (subject, sid, Some(reply_to), header_len, total_len)
+            }
+            (Some(subject), Some(sid), Some(header_len), Some(total_len), None, None) => {
+                (subject, sid, None, header_len, total_len)
+            }
+            _ => return Err(E::InvalidArgumentsCount),
+        };
+
+        // Convert the slice into a subject
+        let subject = Subject::from(subject);
+
+        // Parse the subject ID.
+        let sid = sid.parse::<u64>().map_err(|source| E::InvalidSid {
+            data: sid.to_owned(),
+            source,
+        })?;
+
+        // Convert the slice into a subject.
+        let reply = reply_to.map(Subject::from);
+
+        // Parse the number of payload bytes.
+        let header_len = header_len
+            .parse::<usize>()
+            .map_err(|source| E::InvalidHeaderLen {
+                data: header_len.to_owned(),
+                source,
+            })?;
+
+        // Parse the number of payload bytes.
+        let total_len = total_len
+            .parse::<usize>()
+            .map_err(|source| E::InvalidTotalLen {
+                data: total_len.to_owned(),
+                source,
+            })?;
+
+        if total_len < header_len {
+            return Err(E::IncoherentLenghts {
+                total_len,
+                header_len,
+            });
+        }
+
+        if line_len + total_len + 4 > self.read_buf.remaining() {
+            return Ok(None);
+        }
+
+        self.read_buf.advance(line_len + 2);
+        let header = self.read_buf.split_to(header_len);
+        let payload = self.read_buf.split_to(total_len - header_len).freeze();
+        self.read_buf.advance(2);
+
+        let header = match std::str::from_utf8(&header) {
+            Ok(header) => header,
+            Err(source) => {
+                return Err(E::HeaderNotUtf8 {
+                    raw: header,
+                    source,
+                });
+            }
+        };
+        let mut lines = header.lines().peekable();
+        let version_line = lines.next().ok_or_else(|| E::NoVersionLine)?;
+
+        let version_line_suffix = version_line
+            .strip_prefix("NATS/1.0")
+            .map(str::trim)
+            .ok_or_else(|| E::MissingVersionLeader)?;
+
+        let (status, description) = version_line_suffix
+            .split_once(' ')
+            .map_or((version_line_suffix, ""), |(status, description)| {
+                (status.trim(), description.trim())
+            });
+        let status = if status.is_empty() {
+            None
+        } else {
+            Some(status.parse::<StatusCode>().map_err(E::InvalidStatus)?)
+        };
+        let description = description.is_empty().not().then(|| description.to_owned());
+
+        let mut headers = HeaderMap::new();
+        while let Some(line) = lines.next() {
+            if line.is_empty() {
+                continue;
+            }
+
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| E::MissingHeaderColon(line.to_owned()))?;
+
+            let name = HeaderName::from_str(name).map_err(|source| E::InvalidHeaderName {
+                raw: name.to_owned(),
+                source,
+            })?;
+
+            // Read the header value, which might have been split into multiple lines
+            // `trim_start` and `trim_end` do the same job as doing `value.trim().to_owned()` at the end, but without a reallocation
+            let mut value = value.trim_start().to_owned();
+            while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
+                value.push_str(v);
+            }
+            value.truncate(value.trim_end().len());
+
+            headers.append(name, value.into_header_value());
+        }
+
+        return Ok(Some(ServerOp::Message {
+            length: reply.as_ref().map_or(0, |reply| reply.len()) + subject.len() + total_len,
+            sid,
+            reply,
+            subject,
+            headers: Some(headers),
+            payload,
+            status,
+            description,
+        }));
+    }
+
+    pub(crate) fn read_op(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<ServerOp>, ReadOpError>> + '_ {
         future::poll_fn(|cx| self.poll_read_op(cx))
     }
 
@@ -395,7 +402,7 @@ impl Connection {
     pub(crate) fn poll_read_op(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<io::Result<Option<ServerOp>>> {
+    ) -> Poll<Result<Option<ServerOp>, ReadOpError>> {
         loop {
             if let Some(op) = self.try_read_op()? {
                 return Poll::Ready(Ok(Some(op)));
@@ -406,9 +413,9 @@ impl Connection {
             return match read_buf.poll(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(0)) if self.read_buf.is_empty() => Poll::Ready(Ok(None)),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(ReadOpError::ConnectionReset)),
                 Poll::Ready(Ok(_n)) => continue,
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => Poll::Ready(Err(ReadOpError::Io(err))),
             };
         }
     }
@@ -951,6 +958,166 @@ mod read_op {
 
         server.write_all(b"PONG\r\n").await.unwrap();
         connection.read_op().await.unwrap();
+    }
+}
+
+#[derive(Debug)]
+pub enum ReadOpError {
+    InvalidError {
+        raw_message: Vec<u8>,
+        source: Utf8Error,
+    },
+    Info {
+        raw_message: Vec<u8>,
+        source: serde_json::Error,
+    },
+    Msg(ParseMsgOpError),
+    HMsg(ParseHMsgOpError),
+    InvalidInput(FromUtf8Error),
+    InvalidUtf8Input(String),
+    ConnectionReset,
+    Io(io::Error),
+}
+
+impl Display for ReadOpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadOpError::InvalidError {
+                raw_message: _,
+                source: _,
+            } => f.write_str("received invalid error from server"),
+            ReadOpError::Info {
+                raw_message: _,
+                source: _,
+            } => f.write_str("invalid INFO message"),
+            ReadOpError::Msg(_) => f.write_str("invalid MSG message"),
+            ReadOpError::HMsg(_) => f.write_str("invalid HMSG message"),
+            ReadOpError::InvalidInput(_) => f.write_str("invalid non-UTF8 input"),
+            ReadOpError::InvalidUtf8Input(input) => write!(f, "invalid input: {input}"),
+            ReadOpError::ConnectionReset => f.write_str("connection reset"),
+            ReadOpError::Io(_) => f.write_str("io error"),
+        }
+    }
+}
+
+impl StdError for ReadOpError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ReadOpError::InvalidError { source, .. } => Some(source),
+            ReadOpError::InvalidUtf8Input(_) | ReadOpError::ConnectionReset => None,
+            ReadOpError::Info { source, .. } => Some(source),
+            ReadOpError::Msg(source) => Some(source),
+            ReadOpError::HMsg(source) => Some(source),
+            ReadOpError::InvalidInput(source) => Some(source),
+            ReadOpError::Io(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseMsgOpError {
+    InvalidInput(Utf8Error),
+    ArgumentsCount,
+    Sid { data: String, source: ParseIntError },
+    PayloadLen { data: String, source: ParseIntError },
+}
+
+impl Display for ParseMsgOpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseMsgOpError::InvalidInput(_) => f.write_str("input is invalid"),
+            ParseMsgOpError::ArgumentsCount => f.write_str("invalid number of arguments"),
+            ParseMsgOpError::Sid { data, source: _ } => {
+                write!(f, r#"cannot parse "{data}" as integral sid"#)
+            }
+            ParseMsgOpError::PayloadLen { data, source: _ } => {
+                write!(f, r#"cannot parse "{data}" as integral payload length"#)
+            }
+        }
+    }
+}
+
+impl StdError for ParseMsgOpError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ParseMsgOpError::InvalidInput(source) => Some(source),
+            ParseMsgOpError::ArgumentsCount => None,
+            ParseMsgOpError::Sid { source, .. } | ParseMsgOpError::PayloadLen { source, .. } => {
+                Some(source)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ParseHMsgOpError {
+    InvalidInput(Utf8Error),
+    InvalidArgumentsCount,
+    InvalidSid {
+        data: String,
+        source: ParseIntError,
+    },
+    InvalidHeaderLen {
+        data: String,
+        source: ParseIntError,
+    },
+    InvalidTotalLen {
+        data: String,
+        source: ParseIntError,
+    },
+    IncoherentLenghts {
+        header_len: usize,
+        total_len: usize,
+    },
+    HeaderNotUtf8 {
+        raw: BytesMut,
+        source: Utf8Error,
+    },
+    NoVersionLine,
+    MissingVersionLeader,
+    InvalidStatus(status::InvalidStatusCode),
+    MissingHeaderColon(String),
+    InvalidHeaderName {
+        raw: String,
+        source: header::ParseHeaderNameError,
+    },
+}
+
+impl Display for ParseHMsgOpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseHMsgOpError::InvalidInput(_) => f.write_str("input is invalid"),
+            ParseHMsgOpError::InvalidArgumentsCount => f.write_str("invalid number of arguments"),
+            ParseHMsgOpError::InvalidSid { data, source: _ } => write!(f, r#"cannot parse "{data}" as integral sid"#),
+            ParseHMsgOpError::InvalidHeaderLen { data, source: _ } => write!(f, r#"cannot parse "{data}" as integral header length"#),
+            ParseHMsgOpError::InvalidTotalLen { data, source : _} => write!(f, r#"cannot parse "{data}" as integral total length"#),
+            ParseHMsgOpError::IncoherentLenghts { header_len, total_len } => write!(f, "header length ({header_len}) is expected to be less or equal then total length ({total_len})"),
+            ParseHMsgOpError::HeaderNotUtf8 { raw: _, source: _ } => f.write_str("header not in UTF8"),
+            ParseHMsgOpError::NoVersionLine => f.write_str("version line is missing"),
+            ParseHMsgOpError::MissingVersionLeader => f.write_str(r#""NATS/1.0" leader is missing from version line"#),
+            ParseHMsgOpError::InvalidStatus(_) => f.write_str("status code is invalid"),
+            ParseHMsgOpError::MissingHeaderColon(data) => write!(f, r#"header line "{data}" is missing a colon"#),
+            ParseHMsgOpError::InvalidHeaderName { raw, source: _ } => write!(f, r#"header name "{raw}" is invalid"#),
+        }
+    }
+}
+
+impl StdError for ParseHMsgOpError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ParseHMsgOpError::InvalidInput(source)
+            | ParseHMsgOpError::HeaderNotUtf8 { source, .. } => Some(source),
+            ParseHMsgOpError::InvalidArgumentsCount
+            | ParseHMsgOpError::IncoherentLenghts { .. }
+            | ParseHMsgOpError::NoVersionLine
+            | ParseHMsgOpError::MissingVersionLeader
+            | ParseHMsgOpError::MissingHeaderColon(_) => None,
+            ParseHMsgOpError::InvalidSid { source, .. }
+            | ParseHMsgOpError::InvalidHeaderLen { source, .. }
+            | ParseHMsgOpError::InvalidTotalLen { source, .. } => Some(source),
+            ParseHMsgOpError::InvalidStatus(source) => Some(source),
+            ParseHMsgOpError::InvalidHeaderName { source, .. } => Some(source),
+        }
     }
 }
 

@@ -320,7 +320,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let seed = "SUANQDPB2RUOE4ETUA26CNX7FUKE5ZZKFCQIIW63OX225F2CO7UEXTM7ZY";
     /// let key_pair = std::sync::Arc::new(nkeys::KeyPair::from_seed(seed).unwrap());
     /// // load jwt from creds file or other secure source
@@ -353,7 +353,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let seed = "SUANQDPB2RUOE4ETUA26CNX7FUKE5ZZKFCQIIW63OX225F2CO7UEXTM7ZY";
     /// let key_pair = std::sync::Arc::new(nkeys::KeyPair::from_seed(seed).unwrap());
     /// // load jwt from creds file or other secure source
@@ -400,7 +400,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let nc = async_nats::ConnectOptions::with_credentials_file("path/to/my.creds")
     ///     .await?
     ///     .connect("connect.ngs.global")
@@ -420,7 +420,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let nc = async_nats::ConnectOptions::new()
     ///     .credentials_file("path/to/my.creds")
     ///     .await?
@@ -439,7 +439,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let creds = "-----BEGIN NATS USER JWT-----
     /// eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5...
     /// ------END NATS USER JWT------
@@ -471,7 +471,7 @@ impl ConnectOptions {
     /// # Example
     /// ```no_run
     /// # #[tokio::main]
-    /// # async fn main() -> Result<(), async_nats::ConnectError> {
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     /// let creds = "-----BEGIN NATS USER JWT-----
     /// eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5...
     /// ------END NATS USER JWT------

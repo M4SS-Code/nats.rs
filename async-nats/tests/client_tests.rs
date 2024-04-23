@@ -1,5 +1,4 @@
-// Copyright 2020-2022 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
+// Copyright 2020-2022 The NATS AutConnectError::ConnectTo { field1: ConnectToError::Timeout }on 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
@@ -13,13 +12,16 @@
 
 mod client {
     use async_nats::connection::State;
+    use async_nats::connector::{ConnectAttemptError, ConnectToError};
     use async_nats::header::HeaderValue;
     use async_nats::{
-        ConnectErrorKind, ConnectOptions, Event, Request, RequestErrorKind, ServerAddr, Subject,
+        connector, ConnectOptions, Event, Request, RequestErrorKind, ServerAddr, ServerError,
+        Subject,
     };
     use bytes::Bytes;
     use futures::future::join_all;
     use futures::stream::StreamExt;
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::time::Duration;
@@ -463,9 +465,13 @@ mod client {
         let err = async_nats::ConnectOptions::new()
             .connect(server.client_url())
             .await
-            .unwrap_err()
-            .kind();
-        assert_eq!(ConnectErrorKind::AuthorizationViolation, err);
+            .unwrap_err();
+        assert!(matches!(
+            err.connector().unwrap().as_ref(),
+            connector::Error::Attempt(ConnectAttemptError::ServerError(
+                ServerError::AuthorizationViolation
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -478,7 +484,12 @@ mod client {
         .connect(server.client_url())
         .await
         .unwrap_err();
-        assert_eq!(ConnectErrorKind::AuthorizationViolation, err.kind());
+        assert!(matches!(
+            err.connector().unwrap().as_ref(),
+            connector::Error::Attempt(ConnectAttemptError::ServerError(
+                ServerError::AuthorizationViolation
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -729,10 +740,17 @@ mod client {
             .connect("nats://127.0.0.1:4848")
             .await;
 
-        assert_eq!(
-            timeout_result.unwrap_err().kind(),
-            ConnectErrorKind::TimedOut
-        );
+        assert!(matches!(
+            timeout_result.unwrap_err().connector().unwrap().as_ref(),
+            connector::Error::Attempt(ConnectAttemptError::ConnectTo {
+                address: SocketAddr::V4(address),
+                tls_required: false,
+                source: ConnectToError::Timeout,
+                ..
+            })
+            if address.ip() == &Ipv4Addr::LOCALHOST
+                && address.port() == 4848
+        ));
         startup_listener.notify_one();
     }
 
@@ -905,14 +923,19 @@ mod client {
 
         for _ in 0..5 {
             match rx.recv().await.unwrap() {
-                Event::ClientError(async_nats::ClientError::Other(_)) => (),
-                other => panic!("unexpected event: {:?}", other),
+                Event::ClientError(error) => {
+                    assert!(
+                        matches!(&*error, connector::Error::Attempt(_)),
+                        "unexpected event: {error:?}",
+                    );
+                }
+                other => panic!("unexpected event: {other:?}"),
             };
         }
-        assert_eq!(
-            rx.recv().await.unwrap(),
-            Event::ClientError(async_nats::ClientError::MaxReconnects)
-        );
+        assert!(matches!(
+            &**rx.recv().await.unwrap().client_error().unwrap(),
+            connector::Error::MaxReconnects(_),
+        ));
     }
 
     #[tokio::test]

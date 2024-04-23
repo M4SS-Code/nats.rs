@@ -199,11 +199,13 @@ use tracing::{debug, error};
 
 use core::fmt;
 use std::collections::HashMap;
+use std::error::Error as StdError;
 use std::fmt::Display;
 use std::future::Future;
 use std::iter;
 use std::mem;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::option;
 use std::pin::Pin;
 use std::slice;
@@ -243,7 +245,7 @@ mod auth;
 pub(crate) mod auth_utils;
 pub mod client;
 pub mod connection;
-mod connector;
+pub mod connector;
 mod options;
 
 pub use auth::Auth;
@@ -336,6 +338,22 @@ pub(crate) enum ServerOp {
         description: Option<String>,
         length: usize,
     },
+}
+
+impl ServerOp {
+    const fn to_str(&self) -> &'static str {
+        match self {
+            ServerOp::Ok => "+OK",
+            ServerOp::Info(_) => "INFO",
+            ServerOp::Ping => "PING",
+            ServerOp::Pong => "PONG",
+            ServerOp::Error(_) => "-ERR",
+            ServerOp::Message { headers: None, .. } => "MSG",
+            ServerOp::Message {
+                headers: Some(_), ..
+            } => "HMSG",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -459,7 +477,7 @@ impl ConnectionHandler {
         }
 
         enum ExitReason {
-            Disconnected(Option<io::Error>),
+            Disconnected(Option<DisconnectedError>),
             ReconnectRequested,
             Closed,
         }
@@ -522,7 +540,9 @@ impl ConnectionHandler {
                             return Poll::Ready(ExitReason::Disconnected(None))
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                            return Poll::Ready(ExitReason::Disconnected(Some(
+                                DisconnectedError::ReadOp(err),
+                            )))
                         }
                     }
                 }
@@ -582,7 +602,9 @@ impl ConnectionHandler {
                             continue;
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                            return Poll::Ready(ExitReason::Disconnected(Some(
+                                DisconnectedError::Write(err),
+                            )))
                         }
                     }
                 }
@@ -599,7 +621,9 @@ impl ConnectionHandler {
                             }
                         }
                         Poll::Ready(Err(err)) => {
-                            return Poll::Ready(ExitReason::Disconnected(Some(err)))
+                            return Poll::Ready(ExitReason::Disconnected(Some(
+                                DisconnectedError::Flush(err),
+                            )))
                         }
                     }
                 }
@@ -885,6 +909,34 @@ impl ConnectionHandler {
     }
 }
 
+#[derive(Debug)]
+pub enum DisconnectedError {
+    ReadOp(connection::ReadOpError),
+    Write(io::Error),
+    Flush(io::Error),
+}
+
+impl Display for DisconnectedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            DisconnectedError::ReadOp(_) => "cannot read op from stream",
+            DisconnectedError::Write(_) => "cannot write to stream",
+            DisconnectedError::Flush(_) => "cannot flush stream",
+        };
+
+        f.write_str(s)
+    }
+}
+
+impl StdError for DisconnectedError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            DisconnectedError::ReadOp(source) => Some(source),
+            DisconnectedError::Write(source) | DisconnectedError::Flush(source) => Some(source),
+        }
+    }
+}
+
 /// Connects to NATS with specified options.
 ///
 /// It is generally advised to use [ConnectOptions] instead, as it provides a builder for whole
@@ -935,7 +987,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         state_tx,
         max_payload.clone(),
     )
-    .map_err(|err| ConnectError::with_source(ConnectErrorKind::ServerParse, err))?;
+    .map_err(ConnectError::InvalidServerAddress)?;
 
     let mut info: ServerInfo = Default::default();
     let mut connection = None;
@@ -990,14 +1042,26 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     .build())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Event {
     Connected,
     Disconnected,
     LameDuckMode,
     SlowConsumer(u64),
     ServerError(ServerError),
-    ClientError(ClientError),
+    ClientError(Arc<connector::Error>),
+}
+
+impl Event {
+    #[inline]
+    #[must_use]
+    pub fn client_error(&self) -> Option<&Arc<connector::Error>> {
+        if let Event::ClientError(error) = self {
+            Some(error)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for Event {
@@ -1118,13 +1182,53 @@ impl Display for ConnectErrorKind {
     }
 }
 
-/// Returned when initial connection fails.
-/// To be enumerate over the variants, call [ConnectError::kind].
-pub type ConnectError = error::Error<ConnectErrorKind>;
+#[derive(Debug)]
+pub enum ConnectError {
+    InvalidServerAddress(io::Error),
+    Connector(MaybeArc<connector::Error>),
+}
 
-impl From<io::Error> for ConnectError {
-    fn from(err: io::Error) -> Self {
-        ConnectError::with_source(ConnectErrorKind::Io, err)
+impl ConnectError {
+    #[inline]
+    #[must_use]
+    pub fn connector(&self) -> Option<&MaybeArc<connector::Error>> {
+        if let Self::Connector(error) = self {
+            Some(error)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<MaybeArc<connector::Error>> for ConnectError {
+    fn from(value: MaybeArc<connector::Error>) -> Self {
+        Self::Connector(value)
+    }
+}
+
+impl From<connector::Error> for ConnectError {
+    fn from(value: connector::Error) -> Self {
+        Self::Connector(MaybeArc::Plain(value))
+    }
+}
+
+impl Display for ConnectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ConnectError::InvalidServerAddress(_) => "invalid NATS server address",
+            ConnectError::Connector(_) => "connection error",
+        };
+
+        f.write_str(s)
+    }
+}
+
+impl StdError for ConnectError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ConnectError::InvalidServerAddress(source) => Some(source),
+            ConnectError::Connector(source) => Some(source.as_ref()),
+        }
     }
 }
 
@@ -1256,11 +1360,12 @@ impl Stream for Subscriber {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum CallbackError {
-    Client(ClientError),
+    Client(connector::Error),
     Server(ServerError),
 }
+
 impl std::fmt::Display for CallbackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1276,9 +1381,9 @@ impl From<ServerError> for CallbackError {
     }
 }
 
-impl From<ClientError> for CallbackError {
-    fn from(client_error: ClientError) -> Self {
-        CallbackError::Client(client_error)
+impl From<connector::Error> for CallbackError {
+    fn from(connector_error: connector::Error) -> Self {
+        CallbackError::Client(connector_error)
     }
 }
 
@@ -1287,29 +1392,6 @@ pub enum ServerError {
     AuthorizationViolation,
     SlowConsumer(u64),
     Other(String),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ClientError {
-    Other(String),
-    MaxReconnects,
-}
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Other(error) => write!(f, "nats: {error}"),
-            Self::MaxReconnects => write!(f, "nats: max reconnects reached"),
-        }
-    }
-}
-
-impl ServerError {
-    fn new(error: String) -> ServerError {
-        match error.to_lowercase().as_str() {
-            "authorization violation" => ServerError::AuthorizationViolation,
-            other => ServerError::Other(other.to_string()),
-        }
-    }
 }
 
 impl std::fmt::Display for ServerError {
@@ -1582,6 +1664,53 @@ macro_rules! from_with_timeout {
 pub(crate) use from_with_timeout;
 
 use crate::connection::ShouldFlush;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MaybeArc<T> {
+    Plain(T),
+    Arc(Arc<T>),
+}
+
+impl<T> AsRef<T> for MaybeArc<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<T> Deref for MaybeArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            MaybeArc::Plain(value) => value,
+            MaybeArc::Arc(arc) => arc,
+        }
+    }
+}
+
+impl<T> Display for MaybeArc<T>
+where
+    T: Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MaybeArc::Plain(inner) => inner.fmt(f),
+            MaybeArc::Arc(inner) => inner.fmt(f),
+        }
+    }
+}
+
+impl<T> StdError for MaybeArc<T>
+where
+    T: StdError,
+{
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            MaybeArc::Plain(inner) => inner.source(),
+            MaybeArc::Arc(inner) => inner.source(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
