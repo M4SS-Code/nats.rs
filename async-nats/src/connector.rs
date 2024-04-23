@@ -13,16 +13,15 @@
 
 use crate::auth::Auth;
 use crate::connection::Connection;
+use crate::connection::ReadOpError;
 use crate::connection::State;
 use crate::options::CallbackArg1;
 use crate::tls;
 use crate::AuthError;
-use crate::ClientError;
 use crate::ClientOp;
-use crate::ConnectError;
-use crate::ConnectErrorKind;
 use crate::ConnectInfo;
 use crate::Event;
+use crate::MaybeArc;
 use crate::Protocol;
 use crate::ServerAddr;
 use crate::ServerError;
@@ -37,6 +36,9 @@ use base64::engine::Engine;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::cmp;
+use std::error::Error as StdError;
+use std::fmt;
+use std::fmt::Display;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -106,29 +108,31 @@ impl Connector {
         })
     }
 
-    pub(crate) async fn connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
+    pub(crate) async fn connect(&mut self) -> Result<(ServerInfo, Connection), MaybeArc<Error>> {
         loop {
             match self.try_connect().await {
                 Ok(inner) => return Ok(inner),
-                Err(error) => match error.kind() {
-                    ConnectErrorKind::MaxReconnects => {
-                        return Err(ConnectError::with_source(
-                            crate::ConnectErrorKind::MaxReconnects,
-                            error,
-                        ))
+                Err(err @ Error::MaxReconnects(_)) => {
+                    return Err(MaybeArc::Plain(err));
+                }
+                Err(err) => {
+                    let err = Arc::new(err);
+                    let _ = self
+                        .events_tx
+                        .send(Event::ClientError(Arc::clone(&err)))
+                        .await;
+
+                    if let Some(max_reconnects) = self.options.max_reconnects {
+                        if self.attempts > max_reconnects {
+                            return Err(MaybeArc::Arc(err));
+                        }
                     }
-                    other => {
-                        self.events_tx
-                            .send(Event::ClientError(ClientError::Other(other.to_string())))
-                            .await
-                            .ok();
-                    }
-                },
+                }
             }
         }
     }
 
-    pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), ConnectError> {
+    pub(crate) async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), Error> {
         tracing::debug!("connecting");
         let mut error = None;
 
@@ -144,166 +148,148 @@ impl Connector {
             if let Some(max_reconnects) = self.options.max_reconnects {
                 if self.attempts > max_reconnects {
                     self.events_tx
-                        .send(Event::ClientError(ClientError::MaxReconnects))
+                        .send(Event::ClientError(Arc::new(Error::MaxReconnects(None))))
                         .await
                         .ok();
-                    return Err(ConnectError::new(crate::ConnectErrorKind::MaxReconnects));
+                    return Err(Error::MaxReconnects(error));
                 }
             }
 
-            let duration = (self.options.reconnect_delay_callback)(self.attempts);
+            match self.try_connect_attempt(server_addr).await {
+                Ok(ok) => return Ok(ok),
+                Err(err) => {
+                    error = Some(err);
+                }
+            }
+        }
 
-            sleep(duration).await;
+        Err(error.unwrap().into())
+    }
 
-            let socket_addrs = server_addr
-                .socket_addrs()
+    async fn try_connect_attempt(
+        &mut self,
+        server_addr: ServerAddr,
+    ) -> Result<(ServerInfo, Connection), ConnectAttemptError> {
+        use ConnectAttemptError as E;
+
+        let duration = (self.options.reconnect_delay_callback)(self.attempts);
+
+        sleep(duration).await;
+
+        let socket_addrs = server_addr.socket_addrs().await.map_err(E::SocketAddrs)?;
+        let mut error = None;
+        for socket_addr in socket_addrs {
+            match self
+                .try_connect_to(&socket_addr, server_addr.tls_required(), server_addr.host())
                 .await
-                .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Dns, err))?;
-            for socket_addr in socket_addrs {
-                match self
-                    .try_connect_to(&socket_addr, server_addr.tls_required(), server_addr.host())
-                    .await
-                {
-                    Ok((server_info, mut connection)) => {
-                        if !self.options.ignore_discovered_servers {
-                            for url in &server_info.connect_urls {
-                                let server_addr = url.parse::<ServerAddr>().map_err(|err| {
-                                    ConnectError::with_source(
-                                        crate::ConnectErrorKind::ServerParse,
-                                        err,
-                                    )
-                                })?;
-                                if !self.servers.iter().any(|(addr, _)| addr == &server_addr) {
-                                    self.servers.push((server_addr, 0));
-                                }
-                            }
-                        }
-
-                        let tls_required = self.options.tls_required || server_addr.tls_required();
-                        let mut connect_info = ConnectInfo {
-                            tls_required,
-                            name: self.options.name.clone(),
-                            pedantic: false,
-                            verbose: false,
-                            lang: LANG.to_string(),
-                            version: VERSION.to_string(),
-                            protocol: Protocol::Dynamic,
-                            user: self.options.auth.username.to_owned(),
-                            pass: self.options.auth.password.to_owned(),
-                            auth_token: self.options.auth.token.to_owned(),
-                            user_jwt: None,
-                            nkey: None,
-                            signature: None,
-                            echo: !self.options.no_echo,
-                            headers: true,
-                            no_responders: true,
-                        };
-
-                        if let Some(nkey) = self.options.auth.nkey.as_ref() {
-                            match nkeys::KeyPair::from_seed(nkey.as_str()) {
-                                Ok(key_pair) => {
-                                    let nonce = server_info.nonce.clone();
-                                    match key_pair.sign(nonce.as_bytes()) {
-                                        Ok(signed) => {
-                                            connect_info.nkey = Some(key_pair.public_key());
-                                            connect_info.signature =
-                                                Some(URL_SAFE_NO_PAD.encode(signed));
-                                        }
-                                        Err(_) => {
-                                            return Err(ConnectError::new(
-                                                crate::ConnectErrorKind::Authentication,
-                                            ))
-                                        }
-                                    };
-                                }
-                                Err(_) => {
-                                    return Err(ConnectError::new(
-                                        crate::ConnectErrorKind::Authentication,
-                                    ))
-                                }
-                            }
-                        }
-
-                        if let Some(jwt) = self.options.auth.jwt.as_ref() {
-                            if let Some(sign_fn) = self.options.auth.signature_callback.as_ref() {
-                                match sign_fn.call(server_info.nonce.clone()).await {
-                                    Ok(sig) => {
-                                        connect_info.user_jwt = Some(jwt.clone());
-                                        connect_info.signature = Some(sig);
-                                    }
-                                    Err(_) => {
-                                        return Err(ConnectError::new(
-                                            crate::ConnectErrorKind::Authentication,
-                                        ))
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(callback) = self.options.auth_callback.as_ref() {
-                            let auth = callback
-                                .call(server_info.nonce.as_bytes().to_vec())
-                                .await
-                                .map_err(|err| {
-                                ConnectError::with_source(
-                                    crate::ConnectErrorKind::Authentication,
-                                    err,
-                                )
-                            })?;
-                            connect_info.user = auth.username;
-                            connect_info.pass = auth.password;
-                            connect_info.user_jwt = auth.jwt;
-                            connect_info.signature = auth
-                                .signature
-                                .map(|signature| URL_SAFE_NO_PAD.encode(signature));
-                            connect_info.auth_token = auth.token;
-                            connect_info.nkey = auth.nkey;
-                        }
-
-                        connection
-                            .easy_write_and_flush(
-                                [ClientOp::Connect(connect_info), ClientOp::Ping].iter(),
-                            )
-                            .await?;
-
-                        match connection.read_op().await? {
-                            Some(ServerOp::Error(err)) => match err {
-                                ServerError::AuthorizationViolation => {
-                                    return Err(ConnectError::with_source(
-                                        crate::ConnectErrorKind::AuthorizationViolation,
-                                        err,
-                                    ));
-                                }
-                                err => {
-                                    return Err(ConnectError::with_source(
-                                        crate::ConnectErrorKind::Io,
-                                        err,
-                                    ));
-                                }
-                            },
-                            Some(_) => {
-                                tracing::debug!("connected to {}", server_info.port);
-                                self.attempts = 0;
-                                self.events_tx.send(Event::Connected).await.ok();
-                                self.state_tx.send(State::Connected).ok();
-                                self.max_payload.store(
-                                    server_info.max_payload,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                return Ok((server_info, connection));
-                            }
-                            None => {
-                                return Err(ConnectError::with_source(
-                                    crate::ConnectErrorKind::Io,
-                                    "broken pipe",
-                                ))
+            {
+                Ok((server_info, mut connection)) => {
+                    if !self.options.ignore_discovered_servers {
+                        for url in &server_info.connect_urls {
+                            let server_addr = url.parse::<ServerAddr>().map_err(E::InvalidPeer)?;
+                            if !self.servers.iter().any(|(addr, _)| addr == &server_addr) {
+                                self.servers.push((server_addr, 0));
                             }
                         }
                     }
 
-                    Err(inner) => error.replace(inner),
-                };
-            }
+                    let tls_required = self.options.tls_required || server_addr.tls_required();
+                    let mut connect_info = ConnectInfo {
+                        tls_required,
+                        name: self.options.name.clone(),
+                        pedantic: false,
+                        verbose: false,
+                        lang: LANG.to_string(),
+                        version: VERSION.to_string(),
+                        protocol: Protocol::Dynamic,
+                        user: self.options.auth.username.clone(),
+                        pass: self.options.auth.password.clone(),
+                        auth_token: self.options.auth.token.clone(),
+                        user_jwt: None,
+                        nkey: None,
+                        signature: None,
+                        echo: !self.options.no_echo,
+                        headers: true,
+                        no_responders: true,
+                    };
+
+                    if let Some(nkey) = self.options.auth.nkey.as_ref() {
+                        let key_pair =
+                            nkeys::KeyPair::from_seed(nkey.as_str()).map_err(E::InvalidNKey)?;
+
+                        let nonce = &server_info.nonce;
+                        let signed = key_pair.sign(nonce.as_bytes()).map_err(E::SignWithNonce)?;
+                        connect_info.nkey = Some(key_pair.public_key());
+                        connect_info.signature = Some(URL_SAFE_NO_PAD.encode(signed));
+                    }
+
+                    if let Some((jwt, sign_fn)) = self
+                        .options
+                        .auth
+                        .jwt
+                        .as_ref()
+                        .zip(self.options.auth.signature_callback.as_ref())
+                    {
+                        let sig = sign_fn
+                            .call(server_info.nonce.clone())
+                            .await
+                            .map_err(E::JwtSignatureCallback)?;
+                        connect_info.user_jwt = Some(jwt.clone());
+                        connect_info.signature = Some(sig);
+                    }
+
+                    if let Some(callback) = self.options.auth_callback.as_ref() {
+                        let auth = callback
+                            .call(server_info.nonce.as_bytes().to_vec())
+                            .await
+                            .map_err(E::AuthCallback)?;
+                        connect_info.user = auth.username;
+                        connect_info.pass = auth.password;
+                        connect_info.user_jwt = auth.jwt;
+                        connect_info.signature = auth
+                            .signature
+                            .map(|signature| URL_SAFE_NO_PAD.encode(signature));
+                        connect_info.auth_token = auth.token;
+                        connect_info.nkey = auth.nkey;
+                    }
+
+                    connection
+                        .easy_write_and_flush(
+                            [ClientOp::Connect(connect_info), ClientOp::Ping].iter(),
+                        )
+                        .await
+                        .map_err(E::WriteStream)?;
+
+                    match connection.read_op().await.map_err(E::ReadOp)? {
+                        Some(ServerOp::Error(err)) => {
+                            return Err(E::ServerError(err));
+                        }
+                        Some(_) => {
+                            tracing::debug!("connected to {}", server_info.port);
+                            self.attempts = 0;
+                            self.events_tx.send(Event::Connected).await.ok();
+                            self.state_tx.send(State::Connected).ok();
+                            self.max_payload.store(
+                                server_info.max_payload,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            return Ok((server_info, connection));
+                        }
+                        None => {
+                            return Err(E::BrokenPipe);
+                        }
+                    }
+                }
+
+                Err(source) => {
+                    error = Some(E::ConnectTo {
+                        address: socket_addr,
+                        tls_required: server_addr.tls_required(),
+                        host: server_addr.host().to_owned(),
+                        source,
+                    });
+                }
+            };
         }
 
         Err(error.unwrap())
@@ -314,15 +300,18 @@ impl Connector {
         socket_addr: &SocketAddr,
         tls_required: bool,
         tls_host: &str,
-    ) -> Result<(ServerInfo, Connection), ConnectError> {
+    ) -> Result<(ServerInfo, Connection), ConnectToError> {
+        use ConnectToError as E;
+
         let tcp_stream = tokio::time::timeout(
             self.options.connection_timeout,
             TcpStream::connect(socket_addr),
         )
         .await
-        .map_err(|_| ConnectError::new(crate::ConnectErrorKind::TimedOut))??;
+        .map_err(|_| E::Timeout)?
+        .map_err(E::Connect)?;
 
-        tcp_stream.set_nodelay(true)?;
+        tcp_stream.set_nodelay(true).map_err(E::NoDelay)?;
 
         let mut connection = Connection::new(
             Box::new(tcp_stream),
@@ -330,21 +319,17 @@ impl Connector {
         );
 
         let tls_connection = |connection: Connection| async {
-            let tls_config = Arc::new(
-                tls::config_tls(&self.options)
-                    .await
-                    .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Tls, err))?,
-            );
+            let tls_config = Arc::new(tls::config_tls(&self.options).await.map_err(E::ConfigTls)?);
             let tls_connector = tokio_rustls::TlsConnector::from(tls_config);
 
-            let domain = webpki::types::ServerName::try_from(tls_host)
-                .map_err(|err| ConnectError::with_source(crate::ConnectErrorKind::Tls, err))?;
+            let domain = webpki::types::ServerName::try_from(tls_host).map_err(E::ServerName)?;
 
             let tls_stream = tls_connector
                 .connect(domain.to_owned(), connection.stream)
-                .await?;
+                .await
+                .map_err(E::TlsConnect)?;
 
-            Ok::<Connection, ConnectError>(Connection::new(Box::new(tls_stream), 0))
+            Ok(Connection::new(Box::new(tls_stream), 0))
         };
 
         // If `tls_first` was set, establish TLS connection before getting INFO.
@@ -354,21 +339,11 @@ impl Connector {
             connection = tls_connection(connection).await?;
         }
 
-        let op = connection.read_op().await?;
+        let op = connection.read_op().await.map_err(E::ReadOp)?;
         let info = match op {
             Some(ServerOp::Info(info)) => info,
-            Some(op) => {
-                return Err(ConnectError::with_source(
-                    crate::ConnectErrorKind::Io,
-                    format!("expected INFO, got {:?}", op),
-                ))
-            }
-            None => {
-                return Err(ConnectError::with_source(
-                    crate::ConnectErrorKind::Io,
-                    "expected INFO, got nothing",
-                ))
-            }
+            Some(op) => return Err(E::ExpectedInfo(op.to_str())),
+            None => return Err(E::BrokenPipe),
         };
 
         // If `tls_first` was not set, establish TLS connection if it is required.
@@ -379,6 +354,151 @@ impl Connector {
         };
 
         Ok((*info, connection))
+    }
+}
+
+/// Returned when initial connection fails.
+#[derive(Debug)]
+pub enum Error {
+    MaxReconnects(Option<ConnectAttemptError>),
+    Attempt(ConnectAttemptError),
+}
+
+impl From<ConnectAttemptError> for Error {
+    fn from(value: ConnectAttemptError) -> Self {
+        Self::Attempt(value)
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::MaxReconnects(_) => f.write_str("max number of reconnections reached"),
+            Error::Attempt(_) => f.write_str("connection attempt failed"),
+        }
+    }
+}
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Error::MaxReconnects(source) => source.as_ref().map(|err| err as &dyn StdError),
+            Error::Attempt(source) => Some(source),
+        }
+    }
+}
+
+/// Returned when initial connection fails.
+#[derive(Debug)]
+pub enum ConnectAttemptError {
+    SocketAddrs(io::Error),
+    InvalidPeer(io::Error),
+    InvalidNKey(nkeys::error::Error),
+    SignWithNonce(nkeys::error::Error),
+    JwtSignatureCallback(AuthError),
+    AuthCallback(AuthError),
+    WriteStream(io::Error),
+    ReadOp(ReadOpError),
+    ServerError(ServerError),
+    BrokenPipe,
+    ConnectTo {
+        address: SocketAddr,
+        tls_required: bool,
+        host: String,
+        source: ConnectToError,
+    },
+}
+
+impl Display for ConnectAttemptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectAttemptError::SocketAddrs(_) => f.write_str("invalid socket address"),
+            ConnectAttemptError::InvalidPeer(_) => f.write_str("invalid peer"),
+            ConnectAttemptError::InvalidNKey(_) => f.write_str("invalid nkey"),
+            ConnectAttemptError::SignWithNonce(_) => f.write_str("unable to sign with none"),
+            ConnectAttemptError::JwtSignatureCallback(_) => f.write_str("cannot sign jwt"),
+            ConnectAttemptError::AuthCallback(_) => f.write_str("cannot authenticate"),
+            ConnectAttemptError::WriteStream(_) => f.write_str("cannot write to stream"),
+            ConnectAttemptError::ReadOp(_) => f.write_str("cannot read op from strem"),
+            ConnectAttemptError::ServerError(_) => f.write_str("error received from server"),
+            ConnectAttemptError::BrokenPipe => f.write_str("broken pipe"),
+            &ConnectAttemptError::ConnectTo {
+                address,
+                tls_required,
+                ref host,
+                source: _,
+            } => {
+                let with_without_tls = if tls_required { "with" } else { "without" };
+                write!(
+                    f,
+                    r#"unable to connect to address {address} {with_without_tls} TLS using \
+                    "{host}" as host"#,
+                )
+            }
+        }
+    }
+}
+
+impl StdError for ConnectAttemptError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ConnectAttemptError::SocketAddrs(source)
+            | ConnectAttemptError::InvalidPeer(source)
+            | ConnectAttemptError::WriteStream(source) => Some(source),
+            ConnectAttemptError::InvalidNKey(source)
+            | ConnectAttemptError::SignWithNonce(source) => Some(source),
+            ConnectAttemptError::JwtSignatureCallback(source)
+            | ConnectAttemptError::AuthCallback(source) => Some(source),
+            ConnectAttemptError::ReadOp(source) => Some(source),
+            ConnectAttemptError::ServerError(source) => Some(source),
+            ConnectAttemptError::BrokenPipe => None,
+            ConnectAttemptError::ConnectTo { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ConnectToError {
+    Timeout,
+    Connect(io::Error),
+    NoDelay(io::Error),
+    ConfigTls(io::Error),
+    ServerName(webpki::types::InvalidDnsNameError),
+    TlsConnect(io::Error),
+    ReadOp(ReadOpError),
+    ExpectedInfo(&'static str),
+    BrokenPipe,
+}
+
+impl Display for ConnectToError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConnectToError::Timeout => f.write_str("connection timed out"),
+            ConnectToError::Connect(_) => f.write_str("unable to connect to remote host"),
+            ConnectToError::NoDelay(_) => f.write_str("unable to set TCP stream to NO_DELAY"),
+            ConnectToError::ConfigTls(_) => f.write_str("unable to config TLS"),
+            ConnectToError::ServerName(_) => f.write_str("invalid server name"),
+            ConnectToError::TlsConnect(_) => f.write_str("unable to perform TLS connection"),
+            ConnectToError::ReadOp(_) => f.write_str("unable to read op"),
+            ConnectToError::ExpectedInfo(op) => write!(f, "expected INFO op, obtained {op:?}"),
+            ConnectToError::BrokenPipe => f.write_str("broken pipe"),
+        }
+    }
+}
+
+impl StdError for ConnectToError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            ConnectToError::Timeout
+            | ConnectToError::ExpectedInfo(_)
+            | ConnectToError::BrokenPipe => None,
+            ConnectToError::Connect(source)
+            | ConnectToError::NoDelay(source)
+            | ConnectToError::ConfigTls(source)
+            | ConnectToError::TlsConnect(source) => Some(source),
+            ConnectToError::ServerName(source) => Some(source),
+            ConnectToError::ReadOp(source) => Some(source),
+        }
     }
 }
 
