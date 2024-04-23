@@ -15,11 +15,13 @@ use crate::auth::Auth;
 use crate::connection::Connection;
 use crate::connection::ReadOpError;
 use crate::connection::State;
+use crate::handle_events;
 use crate::options::CallbackArg1;
 use crate::tls;
 use crate::AuthError;
 use crate::ClientOp;
 use crate::ConnectInfo;
+use crate::ConnectOptions;
 use crate::Event;
 use crate::MaybeArc;
 use crate::Protocol;
@@ -33,6 +35,7 @@ use crate::LANG;
 use crate::VERSION;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::engine::Engine;
+use futures::FutureExt;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use std::cmp;
@@ -45,10 +48,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_rustls::rustls;
 
-pub(crate) struct ConnectorOptions {
+pub struct ConnectorOptions {
     pub(crate) tls_required: bool,
     pub(crate) certificates: Vec<PathBuf>,
     pub(crate) client_cert: Option<PathBuf>,
@@ -68,7 +72,7 @@ pub(crate) struct ConnectorOptions {
 }
 
 /// Maintains a list of servers and establishes connections.
-pub(crate) struct Connector {
+pub(crate) struct Handler<const CLIENT_NODE: bool = true> {
     /// A map of servers and number of connect attempts.
     servers: Vec<(ServerAddr, usize)>,
     options: ConnectorOptions,
@@ -88,17 +92,154 @@ pub(crate) fn reconnect_delay_callback_default(attempts: usize) -> Duration {
     }
 }
 
-impl Connector {
-    pub(crate) fn new<A: ToServerAddrs>(
+pub struct Connector<const CLIENT_NODE: bool = true> {
+    pub(crate) handler: Handler<CLIENT_NODE>,
+    pub(crate) events_rx: tokio::sync::mpsc::Receiver<Event>,
+    pub(crate) state_rx: tokio::sync::watch::Receiver<State>,
+    pub(crate) subscription_capacity: usize,
+    pub(crate) event_callback: Option<CallbackArg1<Event, ()>>,
+    pub(crate) inbox_prefix: String,
+    pub(crate) request_timeout: Option<Duration>,
+    pub(crate) retry_on_initial_connect: bool,
+    pub(crate) sender_capacity: usize,
+    pub(crate) ping_interval: Duration,
+}
+
+pub fn create<A: ToServerAddrs>(addrs: A, options: ConnectOptions) -> Result<Connector, io::Error> {
+    create_inner::<A, true>(addrs, options)
+}
+
+pub fn create_leaf_connector<A: ToServerAddrs>(
+    addrs: A,
+    options: ConnectOptions,
+) -> Result<Connector<false>, io::Error> {
+    create_inner::<A, false>(addrs, options)
+}
+
+fn create_inner<A: ToServerAddrs, const CLIENT_NODE: bool>(
+    addrs: A,
+    options: ConnectOptions,
+) -> Result<Connector<CLIENT_NODE>, io::Error> {
+    let ConnectOptions {
+        name,
+        no_echo,
+        max_reconnects,
+        connection_timeout,
+        auth,
+        tls_required,
+        tls_first,
+        certificates,
+        client_cert,
+        client_key,
+        tls_client_config,
+        ping_interval,
+        subscription_capacity,
+        sender_capacity,
+        event_callback,
+        inbox_prefix,
+        request_timeout,
+        retry_on_initial_connect,
+        ignore_discovered_servers,
+        retain_servers_order,
+        read_buffer_capacity,
+        reconnect_delay_callback,
+        auth_callback,
+    } = options;
+
+    let options = ConnectorOptions {
+        tls_required,
+        certificates,
+        client_cert,
+        client_key,
+        tls_client_config,
+        tls_first,
+        auth,
+        no_echo,
+        connection_timeout,
+        name,
+        ignore_discovered_servers,
+        retain_servers_order,
+        read_buffer_capacity,
+        reconnect_delay_callback,
+        auth_callback,
+        max_reconnects,
+    };
+
+    let (events_tx, events_rx) = mpsc::channel(128);
+    let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
+    // We're setting it to the default server payload size.
+    let max_payload = Arc::new(AtomicUsize::new(1024 * 1024));
+
+    let handler = Handler::<CLIENT_NODE>::new(addrs, options, events_tx, state_tx, max_payload)?;
+    Ok(Connector {
+        handler,
+        events_rx,
+        state_rx,
+        subscription_capacity,
+        inbox_prefix,
+        request_timeout,
+        event_callback,
+        retry_on_initial_connect,
+        sender_capacity,
+        ping_interval,
+    })
+}
+
+impl<const CLIENT_NODE: bool> Connector<CLIENT_NODE> {
+    pub async fn connect(&mut self) -> Result<(ServerInfo, Connection), MaybeArc<Error>> {
+        let handle_events_fut =
+            handle_events(&mut self.events_rx, self.event_callback.as_ref()).fuse();
+        let connect_fut = self.handler.connect();
+
+        tokio::pin!(handle_events_fut);
+        tokio::pin!(connect_fut);
+
+        loop {
+            tokio::select! {
+                result = connect_fut.as_mut() => {
+                    return result;
+                },
+
+                () = handle_events_fut.as_mut() => {
+                    tracing::warn!("events handler finished unexpectedly");
+                },
+            }
+        }
+    }
+
+    pub async fn try_connect(&mut self) -> Result<(ServerInfo, Connection), Error> {
+        let handle_events_fut =
+            handle_events(&mut self.events_rx, self.event_callback.as_ref()).fuse();
+        let try_connect_fut = self.handler.try_connect();
+
+        tokio::pin!(handle_events_fut);
+        tokio::pin!(try_connect_fut);
+
+        loop {
+            tokio::select! {
+                result = try_connect_fut.as_mut() => {
+                    return result;
+                },
+
+                () = handle_events_fut.as_mut() => {
+                    tracing::warn!("events handler finished unexpectedly");
+                },
+            }
+        }
+    }
+}
+
+impl<const CLIENT_NODE: bool> Handler<CLIENT_NODE> {
+    fn new<A: ToServerAddrs>(
         addrs: A,
         options: ConnectorOptions,
         events_tx: tokio::sync::mpsc::Sender<Event>,
         state_tx: tokio::sync::watch::Sender<State>,
         max_payload: Arc<AtomicUsize>,
-    ) -> Result<Connector, io::Error> {
+    ) -> Result<Self, io::Error> {
         let servers = addrs.to_server_addrs()?.map(|addr| (addr, 0)).collect();
 
-        Ok(Connector {
+        Ok(Handler {
             attempts: 0,
             servers,
             options,
@@ -194,12 +335,17 @@ impl Connector {
                     }
 
                     let tls_required = self.options.tls_required || server_addr.tls_required();
+                    let lang = if CLIENT_NODE {
+                        LANG.to_string()
+                    } else {
+                        String::new()
+                    };
                     let mut connect_info = ConnectInfo {
                         tls_required,
                         name: self.options.name.clone(),
                         pedantic: false,
                         verbose: false,
-                        lang: LANG.to_string(),
+                        lang,
                         version: VERSION.to_string(),
                         protocol: Protocol::Dynamic,
                         user: self.options.auth.username.clone(),

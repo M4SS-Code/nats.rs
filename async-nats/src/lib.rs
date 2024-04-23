@@ -190,6 +190,8 @@
 #![deny(rustdoc::invalid_rust_codeblocks)]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
+use connector::Connector;
+use options::CallbackArg1;
 use thiserror::Error;
 
 use futures::stream::Stream;
@@ -210,7 +212,6 @@ use std::option;
 use std::pin::Pin;
 use std::slice;
 use std::str::{self, FromStr};
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::ErrorKind;
@@ -237,7 +238,6 @@ const MULTIPLEXER_SID: u64 = 0;
 pub use tokio_rustls::rustls;
 
 use connection::{Connection, State};
-use connector::{Connector, ConnectorOptions};
 pub use header::{HeaderMap, HeaderName, HeaderValue};
 pub use subject::Subject;
 
@@ -436,7 +436,7 @@ struct Multiplexer {
 /// A connection handler which facilitates communication from channels to a single shared connection.
 pub(crate) struct ConnectionHandler {
     connection: Connection,
-    connector: Connector,
+    connector: connector::Handler,
     subscriptions: HashMap<u64, Subscription>,
     multiplexer: Option<Multiplexer>,
     pending_pings: usize,
@@ -449,7 +449,7 @@ pub(crate) struct ConnectionHandler {
 impl ConnectionHandler {
     pub(crate) fn new(
         connection: Connection,
-        connector: Connector,
+        connector: connector::Handler,
         info_sender: tokio::sync::watch::Sender<ServerInfo>,
         ping_period: Duration,
     ) -> ConnectionHandler {
@@ -956,63 +956,38 @@ pub async fn connect_with_options<A: ToServerAddrs>(
     addrs: A,
     options: ConnectOptions,
 ) -> Result<Client, ConnectError> {
-    let ping_period = options.ping_interval;
-
-    let (events_tx, mut events_rx) = mpsc::channel(128);
-    let (state_tx, state_rx) = tokio::sync::watch::channel(State::Pending);
-    // We're setting it to the default server payload size.
-    let max_payload = Arc::new(AtomicUsize::new(1024 * 1024));
-
-    let mut connector = Connector::new(
-        addrs,
-        ConnectorOptions {
-            tls_required: options.tls_required,
-            certificates: options.certificates,
-            client_key: options.client_key,
-            client_cert: options.client_cert,
-            tls_client_config: options.tls_client_config,
-            tls_first: options.tls_first,
-            auth: options.auth,
-            no_echo: options.no_echo,
-            connection_timeout: options.connection_timeout,
-            name: options.name,
-            ignore_discovered_servers: options.ignore_discovered_servers,
-            retain_servers_order: options.retain_servers_order,
-            read_buffer_capacity: options.read_buffer_capacity,
-            reconnect_delay_callback: options.reconnect_delay_callback,
-            auth_callback: options.auth_callback,
-            max_reconnects: options.max_reconnects,
-        },
-        events_tx,
-        state_tx,
-        max_payload.clone(),
-    )
-    .map_err(ConnectError::InvalidServerAddress)?;
+    let Connector {
+        mut handler,
+        mut events_rx,
+        state_rx,
+        subscription_capacity,
+        inbox_prefix,
+        request_timeout,
+        event_callback,
+        retry_on_initial_connect,
+        sender_capacity,
+        ping_interval,
+    } = connector::create(addrs, options).map_err(ConnectError::InvalidServerAddress)?;
 
     let mut info: ServerInfo = Default::default();
     let mut connection = None;
-    if !options.retry_on_initial_connect {
+    if !retry_on_initial_connect {
         debug!("retry on initial connect failure is disabled");
-        let (info_ok, connection_ok) = connector.try_connect().await?;
+        let (info_ok, connection_ok) = handler.try_connect().await?;
         connection = Some(connection_ok);
         info = info_ok;
     }
 
+    let max_payload = Arc::clone(&handler.max_payload);
     let (info_sender, info_watcher) = tokio::sync::watch::channel(info.clone());
-    let (sender, mut receiver) = mpsc::channel(options.sender_capacity);
+    let (sender, mut receiver) = mpsc::channel(sender_capacity);
 
-    let events_handler_task = task::spawn(async move {
-        while let Some(event) = events_rx.recv().await {
-            tracing::info!("event: {}", event);
-            if let Some(event_callback) = &options.event_callback {
-                event_callback.call(event).await;
-            }
-        }
-    });
+    let events_handler_task =
+        task::spawn(async move { handle_events(&mut events_rx, event_callback.as_ref()).await });
 
     let connection_handler_task = task::spawn(async move {
-        if connection.is_none() && options.retry_on_initial_connect {
-            let (info, connection_ok) = match connector.connect().await {
+        if connection.is_none() && retry_on_initial_connect {
+            let (info, connection_ok) = match handler.connect().await {
                 Ok((info, connection)) => (info, connection),
                 Err(err) => {
                     error!("connection closed: {}", err);
@@ -1024,7 +999,7 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         }
         let connection = connection.unwrap();
         let mut connection_handler =
-            ConnectionHandler::new(connection, connector, info_sender, ping_period);
+            ConnectionHandler::new(connection, handler, info_sender, ping_interval);
         connection_handler.process(&mut receiver).await
     });
 
@@ -1032,14 +1007,26 @@ pub async fn connect_with_options<A: ToServerAddrs>(
         info: info_watcher,
         state: state_rx,
         sender,
-        capacity: options.subscription_capacity,
-        inbox_prefix: options.inbox_prefix,
-        request_timeout: options.request_timeout,
+        capacity: subscription_capacity,
+        inbox_prefix,
+        request_timeout,
         max_payload,
         events_handler_task,
         connection_handler_task,
     }
     .build())
+}
+
+async fn handle_events(
+    events_rx: &mut mpsc::Receiver<Event>,
+    event_callback: Option<&CallbackArg1<Event, ()>>,
+) {
+    while let Some(event) = events_rx.recv().await {
+        tracing::info!("event: {}", event);
+        if let Some(event_callback) = &event_callback {
+            event_callback.call(event).await;
+        }
+    }
 }
 
 #[derive(Debug)]
