@@ -77,7 +77,7 @@ impl Display for State {
 }
 
 /// A framed connection
-pub(crate) struct Connection {
+pub struct Connection {
     pub(crate) stream: Box<dyn AsyncReadWrite>,
     read_buf: BytesMut,
     write_buf: VecDeque<Bytes>,
