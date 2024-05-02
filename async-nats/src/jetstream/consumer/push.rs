@@ -490,7 +490,10 @@ impl Consumer<OrderedConfig> {
                 loop {
                     let current_state = state.borrow().to_owned();
 
-                    context.client.state.changed().await.unwrap();
+                    if context.client.state.changed().await.is_err() {
+                        tracing::warn!("stopping consumer, client stopped");
+                        break;
+                    }
                     // State change notification received within the timeout
                     if state.borrow().to_owned() != State::Connected
                         || current_state == State::Connected
