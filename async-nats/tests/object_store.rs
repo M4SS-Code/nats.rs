@@ -23,7 +23,7 @@ mod object_store {
     use rand::RngCore;
     use tokio::io::AsyncReadExt;
 
-    use aws_lc_rs::digest::{self, SHA256};
+    use ring::digest::{self, SHA256};
 
     #[tokio::test]
     async fn get_and_put() {

@@ -1,10 +1,10 @@
-#[cfg(feature = "aws_lc_rs")]
+#[cfg(feature = "aws-lc-rs")]
 use aws_lc_rs as crypto_backend;
-#[cfg(not(feature = "aws_lc_rs"))]
+#[cfg(not(feature = "aws-lc-rs"))]
 use ring as crypto_backend;
 
-#[cfg(not(any(feature = "aws_lc_rs", feature = "ring")))]
-compile_error!("Please enable the `aws_lc_rs` or `ring` feature");
+#[cfg(not(any(feature = "aws-lc-rs", feature = "ring")))]
+compile_error!("Please enable the `aws-lc-rs` or `ring` feature");
 
 use crypto_backend::digest::{Context, SHA256};
 

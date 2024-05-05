@@ -15,6 +15,7 @@
 mod compatibility {
     use aws_lc_rs::digest::{self, SHA256};
     use futures::{pin_mut, stream::Peekable, StreamExt};
+    use ring::digest::{self, SHA256};
 
     use core::panic;
     use std::{collections::HashMap, pin::Pin, str::from_utf8};

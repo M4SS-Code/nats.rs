@@ -42,7 +42,7 @@ webpki = { package = "rustls-webpki", version = "0.102" }
 portable-atomic = "1"
 
 [dev-dependencies]
-aws-lc-rs = "1.6"
+ring = "0.17"
 criterion =  { version = "0.5", features = ["async_tokio"]}
 nats-server = { path = "../nats-server" }
 rand = "0.8"
@@ -58,12 +58,12 @@ num = "0.4.1"
 
 
 [features]
-default = ["server_2_10", "aws_lc_rs"]
+default = ["server_2_10", "aws-lc-rs"]
 # Enables Service API for the client.
 service = []
-aws_lc_rs = ["dep:aws-lc-rs", "tokio-rustls/aws_lc_rs"]
+aws-lc-rs = ["dep:aws-lc-rs", "tokio-rustls/aws-lc-rs"]
 ring = ["dep:ring", "tokio-rustls/ring"]
-fips = ["aws_lc_rs", "tokio-rustls/fips"]
+fips = ["aws-lc-rs", "tokio-rustls/fips"]
 # All experimental features are part of this feature flag.
 experimental = ["service"]
 # Features that require nats-server version 2.10 or higher.
