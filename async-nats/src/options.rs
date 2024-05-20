@@ -42,7 +42,6 @@ use tokio_rustls::rustls;
 /// # }
 /// ```
 pub struct ConnectOptions {
-    // pub(crate) auth: AuthStyle,
     pub(crate) name: Option<String>,
     pub(crate) no_echo: bool,
     pub(crate) max_reconnects: Option<usize>,

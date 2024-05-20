@@ -84,6 +84,10 @@
 //! for _ in 0..10 {
 //!     client.publish(subject, data.clone()).await?;
 //! }
+//!
+//! // Flush internal buffer before exiting to make sure all messages are sent
+//! client.flush().await?;
+//!
 //! #    Ok(())
 //! # }
 //! ```
@@ -1379,6 +1383,30 @@ pub enum ServerError {
     AuthorizationViolation,
     SlowConsumer(u64),
     Other(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClientError {
+    Other(String),
+    MaxReconnects,
+}
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Other(error) => write!(f, "nats: {error}"),
+            Self::MaxReconnects => write!(f, "nats: max reconnects reached"),
+        }
+    }
+}
+
+impl ServerError {
+    fn new(error: String) -> ServerError {
+        match error.to_lowercase().as_str() {
+            "authorization violation" => ServerError::AuthorizationViolation,
+            // error messages can contain case-sensitive values which should be preserved
+            _ => ServerError::Other(error),
+        }
+    }
 }
 
 impl std::fmt::Display for ServerError {
