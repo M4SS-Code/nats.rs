@@ -40,7 +40,12 @@ mod compatibility {
             .init();
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "localhost:4222".to_string());
         tracing::info!("staring client for object store tests at {}", url);
-        let client = async_nats::connect(url).await.unwrap();
+        let client = async_nats::ConnectOptions::new()
+            .max_reconnects(10)
+            .retry_on_initial_connect()
+            .connect(&url)
+            .await
+            .unwrap();
 
         let tests = client
             .subscribe("tests.object-store.>")
@@ -425,7 +430,12 @@ mod compatibility {
     async fn service_core() {
         let url = std::env::var("NATS_URL").unwrap_or_else(|_| "localhost:4222".to_string());
         tracing::info!("staring client for service tests at {}", url);
-        let client = async_nats::connect(url).await.unwrap();
+        let client = async_nats::ConnectOptions::new()
+            .max_reconnects(10)
+            .retry_on_initial_connect()
+            .connect(&url)
+            .await
+            .unwrap();
 
         let mut tests = client
             .subscribe("tests.service.core.>")
