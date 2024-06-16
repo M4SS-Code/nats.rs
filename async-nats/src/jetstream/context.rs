@@ -45,7 +45,6 @@ use super::stream::{
     self, Config, ConsumerError, ConsumerErrorKind, DeleteStatus, DiscardPolicy, External, Info,
     Stream,
 };
-#[cfg(feature = "server_2_10")]
 use super::stream::{Compression, ConsumerCreateStrictError, ConsumerUpdateError};
 
 /// A context which can perform jetstream scoped requests.
@@ -685,7 +684,6 @@ impl Context {
                 num_replicas,
                 discard: stream::DiscardPolicy::New,
                 mirror_direct: config.mirror_direct,
-                #[cfg(feature = "server_2_10")]
                 compression: if config.compression {
                     Some(stream::Compression::S2)
                 } else {
@@ -940,7 +938,6 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "server_2_10")]
     pub async fn update_consumer_on_stream<C: IntoConsumerConfig + FromConsumer, S: AsRef<str>>(
         &self,
         config: C,
@@ -977,7 +974,6 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "server_2_10")]
     pub async fn create_consumer_strict_on_stream<
         C: IntoConsumerConfig + FromConsumer,
         S: AsRef<str>,
@@ -1124,7 +1120,6 @@ impl Context {
                 discard: DiscardPolicy::New,
                 allow_rollup: true,
                 allow_direct: true,
-                #[cfg(feature = "server_2_10")]
                 compression: if config.compression {
                     Some(Compression::S2)
                 } else {
@@ -1720,9 +1715,7 @@ enum ConsumerAction {
     #[serde(rename = "")]
     CreateOrUpdate,
     #[serde(rename = "create")]
-    #[cfg(feature = "server_2_10")]
     Create,
     #[serde(rename = "update")]
-    #[cfg(feature = "server_2_10")]
     Update,
 }

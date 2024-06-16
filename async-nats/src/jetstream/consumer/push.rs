@@ -26,7 +26,6 @@ use bytes::Bytes;
 use futures::{future::BoxFuture, FutureExt};
 use portable_atomic::AtomicU64;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "server_2_10")]
 use std::collections::HashMap;
 use std::task::{self, Poll};
 use std::{
@@ -224,7 +223,6 @@ pub struct Config {
     /// When consuming from a Stream with many subjects, or wildcards, this selects only specific incoming subjects. Supports wildcards.
     #[serde(default, skip_serializing_if = "is_default")]
     pub filter_subject: String,
-    #[cfg(feature = "server_2_10")]
     /// Fulfills the same role as [Config::filter_subject], but allows filtering by many subjects.
     #[serde(default, skip_serializing_if = "is_default")]
     pub filter_subjects: Vec<String>,
@@ -259,7 +257,6 @@ pub struct Config {
     /// Force consumer to use memory storage.
     #[serde(default, skip_serializing_if = "is_default")]
     pub memory_storage: bool,
-    #[cfg(feature = "server_2_10")]
     // Additional consumer metadata.
     #[serde(default, skip_serializing_if = "is_default")]
     pub metadata: HashMap<String, String>,
@@ -291,7 +288,6 @@ impl FromConsumer for Config {
             ack_wait: config.ack_wait,
             max_deliver: config.max_deliver,
             filter_subject: config.filter_subject,
-            #[cfg(feature = "server_2_10")]
             filter_subjects: config.filter_subjects,
             replay_policy: config.replay_policy,
             rate_limit: config.rate_limit,
@@ -303,7 +299,6 @@ impl FromConsumer for Config {
             idle_heartbeat: config.idle_heartbeat,
             num_replicas: config.num_replicas,
             memory_storage: config.memory_storage,
-            #[cfg(feature = "server_2_10")]
             metadata: config.metadata,
             backoff: config.backoff,
             inactive_threshold: config.inactive_threshold,
@@ -324,7 +319,6 @@ impl IntoConsumerConfig for Config {
             ack_wait: self.ack_wait,
             max_deliver: self.max_deliver,
             filter_subject: self.filter_subject,
-            #[cfg(feature = "server_2_10")]
             filter_subjects: self.filter_subjects,
             replay_policy: self.replay_policy,
             rate_limit: self.rate_limit,
@@ -340,7 +334,6 @@ impl IntoConsumerConfig for Config {
             inactive_threshold: self.inactive_threshold,
             num_replicas: self.num_replicas,
             memory_storage: self.memory_storage,
-            #[cfg(feature = "server_2_10")]
             metadata: self.metadata,
             backoff: self.backoff,
         }
@@ -372,7 +365,6 @@ pub struct OrderedConfig {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub filter_subject: String,
-    #[cfg(feature = "server_2_10")]
     /// Fulfills the same role as [Config::filter_subject], but allows filtering by many subjects.
     #[serde(default, skip_serializing_if = "is_default")]
     pub filter_subjects: Vec<String>,
@@ -393,7 +385,6 @@ pub struct OrderedConfig {
     /// The maximum number of waiting consumers.
     #[serde(default, skip_serializing_if = "is_default")]
     pub max_waiting: i64,
-    #[cfg(feature = "server_2_10")]
     // Additional consumer metadata.
     #[serde(default, skip_serializing_if = "is_default")]
     pub metadata: HashMap<String, String>,
@@ -417,7 +408,6 @@ impl FromConsumer for OrderedConfig {
             deliver_subject: config.deliver_subject.unwrap(),
             description: config.description,
             filter_subject: config.filter_subject,
-            #[cfg(feature = "server_2_10")]
             filter_subjects: config.filter_subjects,
             replay_policy: config.replay_policy,
             rate_limit: config.rate_limit,
@@ -425,7 +415,6 @@ impl FromConsumer for OrderedConfig {
             headers_only: config.headers_only,
             deliver_policy: config.deliver_policy,
             max_waiting: config.max_waiting,
-            #[cfg(feature = "server_2_10")]
             metadata: config.metadata,
         })
     }
@@ -444,7 +433,6 @@ impl IntoConsumerConfig for OrderedConfig {
             ack_wait: Duration::default(),
             max_deliver: 1,
             filter_subject: self.filter_subject,
-            #[cfg(feature = "server_2_10")]
             filter_subjects: self.filter_subjects,
             replay_policy: self.replay_policy,
             rate_limit: self.rate_limit,
@@ -460,7 +448,6 @@ impl IntoConsumerConfig for OrderedConfig {
             inactive_threshold: Duration::from_secs(30),
             num_replicas: 1,
             memory_storage: true,
-            #[cfg(feature = "server_2_10")]
             metadata: self.metadata,
             backoff: Vec::new(),
         }

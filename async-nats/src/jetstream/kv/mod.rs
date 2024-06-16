@@ -121,7 +121,6 @@ pub struct Config {
     /// Allow mirrors using direct API.
     pub mirror_direct: bool,
     /// Compression
-    #[cfg(feature = "server_2_10")]
     pub compression: bool,
     /// Cluster and tag placement for the bucket.
     pub placement: Option<stream::Placement>,

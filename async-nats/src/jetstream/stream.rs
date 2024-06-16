@@ -13,7 +13,6 @@
 //
 //! Manage operations on a [Stream], create/delete/update [Consumer].
 
-#[cfg(feature = "server_2_10")]
 use std::collections::HashMap;
 use std::{
     fmt::{self, Debug, Display},
@@ -734,7 +733,6 @@ impl Stream {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "server_2_10")]
     pub async fn update_consumer<C: IntoConsumerConfig + FromConsumer>(
         &self,
         config: C,
@@ -768,7 +766,6 @@ impl Stream {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "server_2_10")]
     pub async fn create_consumer_strict<C: IntoConsumerConfig + FromConsumer>(
         &self,
         config: C,
@@ -1066,29 +1063,24 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<Vec<Source>>,
 
-    #[cfg(feature = "server_2_10")]
     /// Additional stream metadata.
     #[serde(default, skip_serializing_if = "is_default")]
     pub metadata: HashMap<String, String>,
 
-    #[cfg(feature = "server_2_10")]
     /// Allow applying a subject transform to incoming messages
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject_transform: Option<SubjectTransform>,
 
-    #[cfg(feature = "server_2_10")]
     /// Override compression config for this stream.
     /// Wrapping enum that has `None` type with [Option] is there
     /// because [Stream] can override global compression set to [Compression::S2]
     /// to [Compression::None], which is different from not overriding global config with anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<Compression>,
-    #[cfg(feature = "server_2_10")]
     /// Set limits on consumers that are created on this stream.
     #[serde(default, deserialize_with = "default_consumer_limits_as_none")]
     pub consumer_limits: Option<ConsumerLimits>,
 
-    #[cfg(feature = "server_2_10")]
     /// Sets the first sequence for the stream.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "first_seq")]
     pub first_sequence: Option<u64>,
@@ -1113,7 +1105,6 @@ impl From<&str> for Config {
     }
 }
 
-#[cfg(feature = "server_2_10")]
 fn default_consumer_limits_as_none<'de, D>(
     deserializer: D,
 ) -> Result<Option<ConsumerLimits>, D::Error>
@@ -1537,7 +1528,6 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "is_default")]
     pub domain: Option<String>,
     /// Subject transforms for Stream.
-    #[cfg(feature = "server_2_10")]
     #[serde(default, skip_serializing_if = "is_default")]
     pub subject_transforms: Vec<SubjectTransform>,
 }

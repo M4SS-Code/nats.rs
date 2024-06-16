@@ -24,7 +24,6 @@ pub struct AccountInfo {
 
 mod jetstream {
 
-    #[cfg(feature = "server_2_10")]
     use std::collections::HashMap;
     use std::str::from_utf8;
     use std::time::{Duration, Instant};
@@ -41,7 +40,6 @@ mod jetstream {
     use async_nats::jetstream::stream::{
         self, ConsumerCreateStrictErrorKind, ConsumerUpdateErrorKind, DiscardPolicy, StorageType,
     };
-    #[cfg(feature = "server_2_10")]
     use async_nats::jetstream::stream::{Compression, ConsumerLimits, Source, SubjectTransform};
     use async_nats::jetstream::AckKind;
     use async_nats::ConnectOptions;
@@ -1865,7 +1863,6 @@ mod jetstream {
         }
     }
 
-    #[cfg(feature = "server_2_10")]
     #[tokio::test]
     async fn update_consumer() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -2788,7 +2785,6 @@ mod jetstream {
     }
 
     #[tokio::test]
-    #[cfg(feature = "server_2_10")]
     async fn stream_subject_transforms() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
         let client = async_nats::connect(server.client_url()).await.unwrap();
@@ -3084,7 +3080,6 @@ mod jetstream {
         );
     }
 
-    #[cfg(feature = "server_2_10")]
     #[tokio::test]
     async fn multiple_filters_consumer() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -3143,7 +3138,6 @@ mod jetstream {
         }
     }
 
-    #[cfg(feature = "server_2_10")]
     #[tokio::test]
     async fn metadata() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");
@@ -3271,7 +3265,6 @@ mod jetstream {
             .unwrap_err();
     }
 
-    #[cfg(feature = "server_2_10")]
     #[tokio::test]
     async fn subject_transform() {
         use async_nats::jetstream::stream::SubjectTransform;
@@ -3438,7 +3431,6 @@ mod jetstream {
         .unwrap();
     }
 
-    #[cfg(feature = "server_2_10")]
     #[tokio::test]
     async fn stream_config() {
         let server = nats_server::run_server("tests/configs/jetstream.conf");

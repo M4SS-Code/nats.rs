@@ -59,7 +59,7 @@ num = "0.4.1"
 
 
 [features]
-default = ["server_2_10", "aws-lc-rs"]
+default = ["aws-lc-rs"]
 # Enables Service API for the client.
 service = []
 aws-lc-rs = ["dep:aws-lc-rs", "tokio-rustls/aws-lc-rs"]
@@ -67,9 +67,6 @@ ring = ["dep:ring", "tokio-rustls/ring"]
 fips = ["aws-lc-rs", "tokio-rustls/fips"]
 # All experimental features are part of this feature flag.
 experimental = ["service"]
-# Features that require nats-server version 2.10 or higher.
-# It is enabled by default since official 2.10 nats-server release.
-"server_2_10" = []
 # Used for enabling/disabling tests that by design take a lot of time to  complete.
 # Those tests are usually used for time-sensitive checks, like consumer heartbeats, longer timeouts, etc.
 slow_tests = []
@@ -85,5 +82,5 @@ lto = true
 
 [package.metadata.docs.rs]
 # We can't use `all-features` because the `fips` doesn't compile in restricted docs.rs environment.
-features = ["server_2_10",  "service", "experimental", "ring", "aws-lc-rs"]
+features = ["service", "experimental", "ring", "aws-lc-rs"]
 rustdoc-args = ["--cfg", "docsrs"]
