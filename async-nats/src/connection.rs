@@ -1329,6 +1329,7 @@ mod write_op {
                     auth_token: None,
                     headers: false,
                     no_responders: false,
+                    m4ss_zstd: false,
                 })]
                 .iter(),
             )

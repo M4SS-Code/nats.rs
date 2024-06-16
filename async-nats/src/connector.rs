@@ -357,6 +357,7 @@ impl<const CLIENT_NODE: bool> Handler<CLIENT_NODE> {
                         echo: !self.options.no_echo,
                         headers: true,
                         no_responders: true,
+                        m4ss_zstd: server_info.m4ss_zstd,
                     };
 
                     if let Some(nkey) = self.options.auth.nkey.as_ref() {
@@ -399,10 +400,174 @@ impl<const CLIENT_NODE: bool> Handler<CLIENT_NODE> {
                         connect_info.nkey = auth.nkey;
                     }
 
+                    #[cfg(feature = "zstd")]
+                    let m4ss_zstd = connect_info.m4ss_zstd;
+
                     connection
-                        .easy_write_and_flush(
-                            [ClientOp::Connect(connect_info), ClientOp::Ping].iter(),
-                        )
+                        .easy_write_and_flush([ClientOp::Connect(connect_info)].iter())
+                        .await
+                        .map_err(E::WriteStream)?;
+
+                    #[cfg(feature = "zstd")]
+                    if m4ss_zstd {
+                        use std::pin::Pin;
+                        use std::task::{Context, Poll, Waker};
+
+                        use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadBuf};
+
+                        #[derive(Debug)]
+                        struct Maybe<T> {
+                            item: Option<T>,
+                            waker: Option<Waker>,
+                        }
+
+                        impl<T> Maybe<T> {
+                            fn new(item: Option<T>) -> Self {
+                                Self { item, waker: None }
+                            }
+
+                            fn take_item(&mut self) -> Option<T> {
+                                self.item.take()
+                            }
+
+                            fn set_item(&mut self, item: T) {
+                                self.item = Some(item);
+                                if let Some(waker) = self.waker.take() {
+                                    waker.wake();
+                                }
+                            }
+                        }
+
+                        impl<T: AsyncRead + Unpin> AsyncRead for Maybe<T> {
+                            fn poll_read(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                                buf: &mut ReadBuf<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                match &mut self.item {
+                                    Some(item) => Pin::new(item).poll_read(cx, buf),
+                                    None => {
+                                        self.waker = Some(cx.waker().clone());
+                                        Poll::Pending
+                                    }
+                                }
+                            }
+                        }
+
+                        impl<T: AsyncWrite + Unpin> AsyncWrite for Maybe<T> {
+                            fn poll_write(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                                buf: &[u8],
+                            ) -> Poll<io::Result<usize>> {
+                                match &mut self.item {
+                                    Some(item) => Pin::new(item).poll_write(cx, buf),
+                                    None => {
+                                        self.waker = Some(cx.waker().clone());
+                                        Poll::Pending
+                                    }
+                                }
+                            }
+
+                            fn poll_flush(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                match &mut self.item {
+                                    Some(item) => Pin::new(item).poll_flush(cx),
+                                    None => {
+                                        self.waker = Some(cx.waker().clone());
+                                        Poll::Pending
+                                    }
+                                }
+                            }
+
+                            fn poll_shutdown(
+                                self: Pin<&mut Self>,
+                                _cx: &mut Context<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                Poll::Ready(Ok(()))
+                            }
+                        }
+
+                        let stream = connection.stream;
+
+                        let decompressor = async_compression::tokio::bufread::ZstdDecoder::new(
+                            BufReader::new(Maybe::new(Some(stream))),
+                        );
+                        let compressor =
+                            async_compression::tokio::write::ZstdEncoder::new(Maybe::new(None));
+
+                        struct CompressedStream<S> {
+                            decompressor:
+                                async_compression::tokio::bufread::ZstdDecoder<BufReader<Maybe<S>>>,
+                            compressor: async_compression::tokio::write::ZstdEncoder<Maybe<S>>,
+                        }
+
+                        impl<S> AsyncRead for CompressedStream<S>
+                        where
+                            S: AsyncRead + AsyncWrite + Unpin,
+                        {
+                            fn poll_read(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                                buf: &mut ReadBuf<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                if let Some(stream) = self.compressor.get_mut().take_item() {
+                                    self.decompressor.get_mut().get_mut().set_item(stream);
+                                }
+
+                                Pin::new(&mut self.decompressor).poll_read(cx, buf)
+                            }
+                        }
+
+                        impl<S> AsyncWrite for CompressedStream<S>
+                        where
+                            S: AsyncRead + AsyncWrite + Unpin,
+                        {
+                            fn poll_write(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                                buf: &[u8],
+                            ) -> Poll<io::Result<usize>> {
+                                if let Some(stream) =
+                                    self.decompressor.get_mut().get_mut().take_item()
+                                {
+                                    self.compressor.get_mut().set_item(stream);
+                                }
+
+                                Pin::new(&mut self.compressor).poll_write(cx, buf)
+                            }
+
+                            fn poll_flush(
+                                mut self: Pin<&mut Self>,
+                                cx: &mut Context<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                if let Some(stream) =
+                                    self.decompressor.get_mut().get_mut().take_item()
+                                {
+                                    self.compressor.get_mut().set_item(stream);
+                                }
+
+                                Pin::new(&mut self.compressor).poll_flush(cx)
+                            }
+
+                            fn poll_shutdown(
+                                self: Pin<&mut Self>,
+                                _cx: &mut Context<'_>,
+                            ) -> Poll<io::Result<()>> {
+                                Poll::Ready(Ok(()))
+                            }
+                        }
+
+                        connection.stream = Box::new(CompressedStream {
+                            decompressor,
+                            compressor,
+                        });
+                    }
+
+                    connection
+                        .easy_write_and_flush([ClientOp::Ping].iter())
                         .await
                         .map_err(E::WriteStream)?;
 

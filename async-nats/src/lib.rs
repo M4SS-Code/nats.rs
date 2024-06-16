@@ -323,6 +323,8 @@ pub struct ServerInfo {
     /// Whether server goes into lame duck mode.
     #[serde(default, rename = "ldm")]
     pub lame_duck_mode: bool,
+    #[serde(default)]
+    pub m4ss_zstd: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1478,6 +1480,13 @@ pub struct ConnectInfo {
 
     /// Whether the client supports no_responders.
     pub no_responders: bool,
+
+    #[serde(skip_serializing_if = "is_default")]
+    pub m4ss_zstd: bool,
+}
+
+fn is_default(m4ss_zstd: &bool) -> bool {
+    !*m4ss_zstd
 }
 
 /// Protocol version used by the client.
