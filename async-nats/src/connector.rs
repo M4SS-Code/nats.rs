@@ -495,8 +495,10 @@ impl<const CLIENT_NODE: bool> Handler<CLIENT_NODE> {
                         let decompressor = async_compression::tokio::bufread::ZstdDecoder::new(
                             BufReader::new(Maybe::new(Some(stream))),
                         );
-                        let compressor =
-                            async_compression::tokio::write::ZstdEncoder::new(Maybe::new(None));
+                        let compressor = async_compression::tokio::write::ZstdEncoder::with_quality(
+                            Maybe::new(None),
+                            async_compression::Level::Precise(15),
+                        );
 
                         struct CompressedStream<S> {
                             decompressor:
